@@ -1,0 +1,58 @@
+{
+    "name": "@dsh-external/dsh-persona-memory-consolidate",
+    "version": "0.1.0",
+    "description": "DSH 记忆自动沉淀（附属插件）：回合结束只写 L0 暂存，攒够 6 轮/8000 字符后一次抽取成结论式条目，经主插件 store 的校验与闸口写进 JOURNAL.jsonl / FACT.md / MEMORY.md；撞限只降级 JOURNAL，不自行压缩",
+    "type": "module",
+    "main": "./lib/index.js",
+    "types": "./lib/types/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./lib/types/index.d.ts",
+            "default": "./lib/index.js"
+        },
+        "./package.json": "./package.json"
+    },
+    "files": [
+        "lib",
+        "cordis.patch.yml",
+        "README.md"
+    ],
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/hu568/dsh-plugin-persona-memory-consolidate.git"
+    },
+    "homepage": "https://github.com/hu568/dsh-plugin-persona-memory-consolidate#readme",
+    "bugs": {
+        "url": "https://github.com/hu568/dsh-plugin-persona-memory-consolidate/issues"
+    },
+    "keywords": [
+        "dsh",
+        "dsh-plugin",
+        "dsh-plugin-pack",
+        "cordis",
+        "cordis-plugin",
+        "memory",
+        "consolidate",
+        "bm25"
+    ],
+    "scripts": {
+        "check": "node --check lib/index.js",
+        "test": "pwsh -File test/run-all.ps1"
+    },
+    "engines": {
+        "node": ">=22"
+    },
+    "peerDependencies": {
+        "@dsh-external/dsh-persona-memory": ">=0.7.0 <0.9.0",
+        "cordis": ">=4.0.0-rc <5"
+    },
+    "dependencies": {
+        "schemastery": "npm:@deepseek-ai/schemastery@3.18.2"
+    },
+    "dsh": {
+        "bundle": {
+            "patch": "./cordis.patch.yml"
+        }
+    }
+}

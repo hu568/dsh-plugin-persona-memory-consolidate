@@ -1,0 +1,63 @@
+# dsh-persona-memory-consolidate bundle 层：把「自动沉淀」插件行插进**宿主组合**。
+#
+# 为什么是宿主平面而不是 agent 预设：沉淀要观察**每个会话**的回合结束（`session/event` 的
+# `turn/end`，M0 实测比轮询 `agent/status` 可靠）并把 `$DSH_HOME/memory/consolidate/` 当作
+# 自己唯一的数据落点，它与 `commands` 注册表同层，所以 `/memory-consolidate` 对所有预设都是全局命令。
+#
+# 三行是**独立**的，可以单独停用：
+#   persona-memory             → 角色/全局/项目记忆（系统提示词段落，首条消息冻结）
+#   persona-memory-recall      → 长期日志按轮召回（本轮用户消息之后的一条 user 快照）
+#   persona-memory-consolidate → 写侧沉淀（本插件：回合结束写 L0，攒够门槛才花 1 次 LLM）
+#
+# 本插件**不碰系统提示词**，也不自己 fs 写 FACT/MEMORY：条目模板、校验、闸口、
+# 备份、原子写、锁全部调主插件导出的 `@dsh-external/dsh-persona-memory/store`。
+# 未装主插件 0.7.0 时插件仍可加载（命令可查状态），但写入阶段一律判 store 不可用。
+- insert:
+    - id: persona-memory-consolidate
+      name: '@dsh-external/dsh-persona-memory-consolidate'
+      config:
+        # ── 总开关 ──
+        enabled: true
+        # 干跑：只出报告不落盘。默认关闭；一次性演练用 `/memory-consolidate dry`
+        dryRun: false
+        # journal = 只写 JOURNAL；both = JOURNAL + FACT/MEMORY
+        scope: both
+        # ── 消费门槛（先到先算）──
+        minTurns: 6
+        minChars: 8000
+        # 单回合结论截断（02 §7.1 成本参数）
+        perTurnCap: 1200
+        # 单次沉淀输入上限（字符）
+        maxSampleChars: 8000
+        # ── 工作区隔离（02 §7.0）──
+        workspaceIsolation: true
+        # 空 = $DSH_HOME/storages/workspace.json
+        workspaceRegistry: ''
+        unassignedBucket: '_unassigned'
+        # ── 暂存与兜底 ──
+        pendingMaxRows: 200
+        pendingMaxAgeDays: 30
+        archiveRetentionDays: 90
+        idleScanMinutes: 30
+        # ── 预算与调用 ──
+        # 总量；第一层 50 / 第二层 10 由实现按阶段扣减
+        dailyLlmBudget: 60
+        maxTurnsPerCall: 6
+        # 预留：中断回合是否留 partial（默认关，见 02 §6.6）
+        partialKeep: false
+        provider: ''
+        model: ''
+        subagent: false
+        redact: true
+        # ── 跨会话（L2）──
+        crossEnabled: true
+        # journal | service | files | auto
+        crossSource: auto
+        crossIntervalHours: 24
+        crossMinEntries: 20
+        crossScanEntries: 200
+        crossPromoteHits: 2
+        # 仅 files 档用
+        crossMaxSessions: 20
+        # 仅 files 档用
+        crossLookbackDays: 7
