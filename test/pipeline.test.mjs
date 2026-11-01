@@ -253,6 +253,36 @@ try {
     assert.equal(nothing.skipped, 'no-candidates');
     assert.equal(nothing.calls, 1);
     assert.equal(readUnconsumed({ pendingDir: nothingRuntime.pendingDir, bucket: 'ws-11' }).length, 6);
+    /* ── 11. 影子档（mode: observe）：管线真跑 + 与 auto 同样的记账，但 FACT / MEMORY / JOURNAL 一字不动 ── */
+    seedRows({ bucket: 'ws-12', sessionId: 'session-l', count: 6, cwd: projectDir });
+    const observeRuntime = makeRuntime({
+        store,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: '影子档里这条本来会被写进 FACT', confidence: 'high' }] }) }),
+        config: { dryRun: false, mode: 'observe' },
+    });
+    const factShaShadow = sha256(store.factPath());
+    const memoryShaShadow = sha256(join(projectDir, 'MEMORY.md'));
+    const journalShaShadow = sha256(store.journalPath());
+    const observed = await runL1({ runtime: observeRuntime, bucket: { workspaceId: 'ws-12', path: projectDir }, now: NOW + 110 });
+
+    assert.equal(observed.status, 'OBSERVED', '影子运行不能记成 OK（否则统计里就变成「真实写入成功」）');
+    assert.equal(observed.observe, true);
+    assert.equal(observed.counts.written, 0, '影子档不算写成功');
+    assert.equal(observed.counts.observed, 1, '影子里本来会写 1 条');
+    assert.equal(sha256(store.factPath()), factShaShadow, 'FACT.md 的 SHA256 必须不变');
+    assert.equal(sha256(join(projectDir, 'MEMORY.md')), memoryShaShadow, 'MEMORY.md 的 SHA256 必须不变');
+    assert.equal(sha256(store.journalPath()), journalShaShadow, 'JOURNAL.jsonl 的 SHA256 必须不变');
+    /* 内部记账与 auto 一致：行要消费、游标要推进（否则同一批素材被反复采样、反复烧 LLM） */
+    assert.equal(readUnconsumed({ pendingDir: observeRuntime.pendingDir, bucket: 'ws-12' }).length, 0, '影子档按 auto 口径消费暂存行');
+    assert.equal(observed.marked.marked, 6, '6 行都要标记已消费');
+    assert.equal(readCursor(observeRuntime.cursorFile).sessions['ws-12:session-l'].turn, 6, 'L1 游标推进到本次消费的最大回合');
+    assert.ok(existsSync(join(observeRuntime.backupsDir, observed.runId)) === false, '影子档不建记忆文件快照');
+    assert.equal(observed.snapshot, '', '影子档不建快照');
+    assert.equal(readLastRun({ file: observeRuntime.runLog.path }).status, 'OBSERVED', 'runlog 要记 OBSERVED');
+    assert.ok(typeof observed.wouldWrite?.file === 'string' && observed.wouldWrite.file !== '', '影子文件路径要能拿到');
+    const shadowLines = readFileSync(observed.wouldWrite.file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.ok(shadowLines.some((line) => line.content === '影子档里这条本来会被写进 FACT'), '影子文件要含本来会写的正文');
+    assert.ok(shadowLines.every((line) => String(line.status).startsWith('would-')));
 } finally {
     cleanup();
 }

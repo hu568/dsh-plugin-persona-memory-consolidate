@@ -535,7 +535,40 @@ try {
         'ctx.on("session/event") 注册的处理器就是主触发',
     );
 
-    /* ── 12. 坏输入不炸（宿主形状变了也不许抛） ── */
+    /* ── 12. 影子档（observe）自动触发与 auto 一致：门槛到了照常排队消费 ── */
+    const observeRuntime = freshRuntime('observe', { mode: 'observe', minTurns: 1, minChars: 100 });
+    const observeRuns = [];
+    const observeTrigger = createAutoTrigger({ runtime: observeRuntime, now: NOW, runConsume: recordingRunner(observeRuns) });
+    observeTrigger.onSessionEvent(
+        sessionOf(SESSION_MAIN, makeTurn({ turn: 1, user: '影子档也自动跑', assistant: [LONG_ASSISTANT] }, { seq: 0 })),
+        turnEnd(1),
+    );
+    await flush();
+    assert.equal(observeRuns.length, 1, 'observe 档与 auto 同口径：门槛到了就自动消费一次');
+    assert.equal(observeRuns[0].workspaceId, 'ws-auto');
+    assert.equal(
+        readRows({ pendingDir: observeRuntime.pendingDir, bucket: 'ws-auto', sessionId: SESSION_MAIN }).length,
+        1,
+        'L0 照写（影子档也走同一条自动链路）',
+    );
+
+    /* off 档则相反：完全不花调用 */
+    const offModeRuntime = freshRuntime('off-mode', { mode: 'off', minTurns: 1, minChars: 100 });
+    const offModeRuns = [];
+    const offModeTrigger = createAutoTrigger({ runtime: offModeRuntime, now: NOW, runConsume: recordingRunner(offModeRuns) });
+    offModeTrigger.onSessionEvent(
+        sessionOf(SESSION_MAIN, makeTurn({ turn: 1, user: 'off 档静默', assistant: [LONG_ASSISTANT] }, { seq: 0 })),
+        turnEnd(1),
+    );
+    await flush();
+    assert.deepEqual(offModeRuns, [], 'off 档不许有任何自动消费');
+    assert.equal(
+        readRows({ pendingDir: offModeRuntime.pendingDir, bucket: 'ws-auto', sessionId: SESSION_MAIN }).length,
+        0,
+        'off 档连 L0 都不写',
+    );
+
+    /* ── 13. 坏输入不炸（宿主形状变了也不许抛） ── */
     const rough = createAutoTrigger({ runtime: freshRuntime('rough'), now: NOW });
     for (const [session, event] of [
         [undefined, undefined],

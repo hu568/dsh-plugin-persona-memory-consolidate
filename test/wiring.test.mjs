@@ -65,6 +65,8 @@ assert.equal((await import('../lib/milestone.js')).MILESTONE, 'M5');
 const defaults = Config({});
 const EXPECTED = {
     enabled: true,
+    // P1 运行档位：默认 auto ⇒ 没改过设置的人行为与改造前完全一致
+    mode: 'auto',
     dryRun: false,
     scope: 'both',
     minTurns: 6,

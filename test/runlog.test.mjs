@@ -121,9 +121,21 @@ try {
     const emptySummary = summarize({ file: join(home, 'consolidate', 'no-such.jsonl'), days: 7, now: T });
     assert.deepEqual(emptySummary, {
         runs: 0, ok: 0, fail: 0, dry: 0, characters: 0, noopRatio: 0,
-        demoted: 0, dropped: 0, avgCalls: 0, lastRunAt: 0, byWorkspace: {},
+        demoted: 0, dropped: 0, avgCalls: 0, lastRunAt: 0, observed: 0, wouldWrite: 0, byWorkspace: {},
     });
     assert.equal(successRate(emptySummary), 0, '没有运行 ⇒ 成功率 0（不除以 0）');
+
+    /* ── 影子运行（OBSERVED）不进真实写入统计，只单独计数 ── */
+    const shadowCounts = { written: 0, demoted: 0, dropped: 0, observed: 3 };
+    summaryLog.append({ runId: 's6', phase: 'layer1', status: 'OBSERVED', workspaceId: 'ws-a', chars: 400, calls: 1, counts: shadowCounts }, T - 6 * 60 * 60 * 1000);
+    const withShadow = summarize({ file: summaryFile, days: 7, now: T });
+    assert.equal(withShadow.runs, 5, 'OBSERVED 不计入 runs（否则成功率/NOOP 比例会被稀释）');
+    assert.equal(withShadow.ok, 1);
+    assert.equal(withShadow.observed, 1, '影子运行单独计次');
+    assert.equal(withShadow.wouldWrite, 3, '影子运行本来会写的算子数单独汇总');
+    assert.equal(withShadow.characters, 1000 + 500 + 0 + 200, '影子运行的 chars 也不进真实统计');
+    assert.equal(Object.keys(withShadow.byWorkspace).includes('ws-a'), true);
+    assert.equal(withShadow.byWorkspace['ws-a'].runs, 2, '影子运行不进 byWorkspace');
 
     /* 坏行 / 半截追加：跳过，不影响其余统计 */
     const brokenFile = join(home, 'consolidate', 'broken.jsonl');

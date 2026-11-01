@@ -161,6 +161,41 @@ try {
     assert.equal(prepareFailed.kind, 'error');
     assert.ok(prepareFailed.text.includes('模型接线失败'));
 
+    /* ── 运行档位（P1）：status 要显示档位；off 档拒绝正式写入；observe 跑影子 ── */
+    assert.ok(status.text.includes('运行档位：正式写入（auto）'), `status 要显示当前档位：${status.text}`);
+
+    const offModeRuntime = makeRuntime({ store, model, config: { dryRun: false, mode: 'off' } });
+    offModeRuntime.pendingDir = runtime.pendingDir;
+    const offModeCommands = createCommands(offModeRuntime);
+    const offStatus = await offModeCommands.handle({ rawInput: 'status' });
+    assert.ok(offStatus.text.includes('关闭（off'), `off 档 status 要如实说：${offStatus.text}`);
+    const offRun = await offModeCommands.handle({ rawInput: 'run' });
+    assert.equal(offRun.kind, 'error', 'off 档不许正式写入');
+    assert.ok(offRun.text.includes('off'), `拒绝文案要说出档位：${offRun.text}`);
+    // `dry` 仍然可用（只读报告），不然排查时连报告都拿不到
+    const offDry = await offModeCommands.handle({ rawInput: 'dry' });
+    assert.equal(offDry.kind, 'success', `off 档 dry 应该仍能跑：${offDry.text}`);
+
+    /* observe 档：真跑管线、FACT/MEMORY 的 SHA256 不变、报告指向 would-write */
+    const observeRuntime = makeRuntime({
+        store,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: '命令层影子档的这条不该落盘', confidence: 'high' }] }) }),
+        config: { dryRun: false, mode: 'observe' },
+    });
+    observeRuntime.pendingDir = join(home, 'pending-observe');
+    seedRows({ pendingDir: observeRuntime.pendingDir, bucket: 'ws-obs', sessionId: 'session-obs', count: 6, cwd: projectDir });
+    const factShaObserve = sha256(store.factPath());
+    const memoryShaObserve = sha256(join(projectDir, 'MEMORY.md'));
+    const observeCommands = createCommands(observeRuntime);
+    const observeRun = await observeCommands.handle({ rawInput: 'run' });
+    assert.equal(observeRun.kind, 'success', `observe 档 run 应成功：${observeRun.text}`);
+    assert.ok(observeRun.text.includes('影子模式（observe，不落盘）'), `报告头要说明是影子：${observeRun.text}`);
+    assert.ok(observeRun.text.includes('would-write') || observeRun.text.includes('影子文件：'), '报告要指向影子文件');
+    assert.equal(sha256(store.factPath()), factShaObserve, 'observe 档 FACT.md 的 SHA256 不变');
+    assert.equal(sha256(join(projectDir, 'MEMORY.md')), memoryShaObserve, 'observe 档 MEMORY.md 的 SHA256 不变');
+    assert.equal(readUnconsumed({ pendingDir: observeRuntime.pendingDir, bucket: 'ws-obs' }).length, 0, 'observe 档与 auto 同口径消费暂存行');
+    assert.ok(observeRun.text.includes('切到 auto 后不会补写'), '报尾要点明「观察期消费的素材不会补写」这个取舍');
+
     /* ── 纯函数：verdictOf / renderRunResult ── */
     assert.equal(verdictOf({ skipped: 'empty', runs: [] }), 'success');
     assert.equal(verdictOf({ skipped: 'budget', reason: 'daily-budget', runs: [] }), 'error');

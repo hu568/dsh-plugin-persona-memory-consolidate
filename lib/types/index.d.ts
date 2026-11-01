@@ -58,8 +58,14 @@ export type CrossSource = 'auto' | 'journal' | 'service' | 'files';
  * （见 `SettingItem`），页面回写只存用户显式改过的键。
  */
 export interface Config {
-    /** 总开关；关掉即完全静默（L0 也不写）。 */
+    /** 总开关；关掉即完全静默（L0 也不写）。只在 `auto` 档生效。 */
     enabled: boolean;
+    /**
+     * 运行档位：`off`（完全静默，等价 enabled=false）/ `observe`（真跑管线但只写
+     * would-write 影子文件，不碰 FACT / MEMORY / JOURNAL）/ `auto`（正式写入，默认）。
+     * 显式 `off` / `observe` 压过 `enabled`；`auto` 才跟随 `enabled`。
+     */
+    mode: 'off' | 'observe' | 'auto';
     /** 干跑：只出报告不落盘。观察期默认开启。 */
     dryRun: boolean;
     /** `journal` 只写 JOURNAL；`both` 也写 FACT / MEMORY（仍受主插件闸口约束）。 */
@@ -301,7 +307,10 @@ export interface WriteContext {
     cwd?: string;
     workspaceId?: string;
     dryRun?: boolean;
+    /** 显式档位（管线传 `observe` 时走影子）；缺省看 writer 的 `resolveMode`。 */
+    mode?: 'off' | 'observe' | 'auto';
     layer?: number;
+    runId?: string;
     now?: number;
 }
 
@@ -316,12 +325,20 @@ export interface WriteResult {
     [key: string]: unknown;
 }
 
+/** 影子文件写入情况（非影子档为 `null`）。 */
+export interface WouldWriteSummary {
+    file: string;
+    lines: number;
+    failed: number;
+}
+
 /** 写盘器（撞限只降级 JOURNAL，绝不自己压缩 FACT/MEMORY）。 */
 export interface Writer {
     apply(ops: MergeOp[], context?: WriteContext): Promise<{
         results: WriteResult[];
         counts: Record<string, number>;
         watermarks: Record<string, unknown>;
+        wouldWrite: WouldWriteSummary | null;
     }>;
 }
 

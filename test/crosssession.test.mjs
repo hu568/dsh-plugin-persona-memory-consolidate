@@ -40,7 +40,8 @@ import {
 } from '../lib/crosssession.js';
 import { consolidateDir } from '../lib/cursor.js';
 import { appendRow } from '../lib/pending.js';
-import { NOW, fakeStore, makeHome, makeRuntime, memoryStore } from './_helpers.mjs';
+import { wouldWritePath } from '../lib/runlog.js';
+import { NOW, fakeStore, makeHome, makeRuntime, memoryStore, sha256 } from './_helpers.mjs';
 
 const { home, cleanup } = makeHome('pmc-cross-run');
 
@@ -466,6 +467,77 @@ try {
         assert.equal(merged.ops[1].layer, 2, 'L2 的算子带 layer:2（DELETE 才被允许）');
         assert.equal(merged.counts.noop, 1);
         assert.equal(merged.counts.added, 1);
+    }
+    /* ══════════════════════ 14. 影子档（mode: observe）：L2 真跑，但一个字节都不写 ══════════════════════ */
+    {
+        const projectDir = join(home, 'proj-observe');
+        mkdirSync(projectDir, { recursive: true });
+        const store = memoryStore({
+            home,
+            projectDir,
+            factText: '## 约定\n\n- 已有的结论\n',
+            memoryText: '## 结论\n\n1. 项目记忆\n',
+        });
+        // 素材：两条同义（凑够 crossPromoteHits=2）的服务条目 + 一条要被试失效的 JOURNAL 条目
+        const entries = [
+            { id: 's1', text: '跨会话的稳定结论：先看 would-write 再开 auto', origin: 'service', session: 'session-1', workspaceId: 'ws-obs' },
+            { id: 's2', text: '跨会话的稳定结论：先看 would-write 再开 auto', origin: 'service', session: 'session-2', workspaceId: 'ws-obs' },
+            { id: 'j1', text: '旧的 JOURNAL 结论：依赖用 pnpm install', origin: 'journal', session: 'session-3' },
+        ];
+        const reply = JSON.stringify({
+            promote: [{ scope: 'global', content: '跨会话的稳定结论：先看 would-write 再开 auto', hits: 2 }],
+            supersede: [{ id: 'j1', reason: 'contradicted-by-fact' }],
+            retire: [],
+        });
+        const runtime = crossRuntime({ store, model: crossModel(reply), entries, config: { mode: 'observe', dryRun: false } });
+
+        let supersedeCalls = 0;
+        store.supersedeJournal = async () => {
+            supersedeCalls += 1;
+            return { moved: 1, archived: 1 };
+        };
+        const supersededBefore = existsSync(runtime.supersededFile)
+            ? readFileSync(runtime.supersededFile, 'utf8').trim().split('\n').length
+            : 0;
+        const factSha = sha256(store.factPath());
+        const memorySha = sha256(join(projectDir, 'MEMORY.md'));
+        const journalSha = sha256(store.journalPath());
+
+        const result = await runL2({ runtime, manual: true, now: NOW, dryRun: false });
+
+        assert.equal(result.status, 'OBSERVED', `L2 影子档要记 OBSERVED：${result.status} / ${result.reason}`);
+        assert.equal(result.observe, true);
+        assert.equal(supersedeCalls, 0, '影子档绝不调 supersedeJournal（那是真写 JOURNAL）');
+        assert.equal(sha256(store.factPath()), factSha, 'FACT.md 的 SHA256 必须不变');
+        assert.equal(sha256(join(projectDir, 'MEMORY.md')), memorySha, 'MEMORY.md 的 SHA256 必须不变');
+        assert.equal(sha256(store.journalPath()), journalSha, 'JOURNAL.jsonl 的 SHA256 必须不变');
+        assert.equal(
+            existsSync(runtime.supersededFile) ? readFileSync(runtime.supersededFile, 'utf8').trim().split('\n').length : 0,
+            supersededBefore,
+            '影子档不写 superseded.jsonl',
+        );
+        assert.ok(!store.calls.some((call) => ['insertEntry', 'replaceEntry', 'deleteEntry', 'appendJournal'].includes(call.name)), '影子档一个写入方法都不调');
+        assert.equal(result.counts.written, 0, '影子结果不算真实写入');
+        assert.equal(result.counts.superseded, 1, '本来会失效 1 条（只记预览条数）');
+        assert.equal(result.snapshot, '', '影子档不建记忆文件快照');
+
+        /* runlog：OBSERVED + 正文一个字都不进 */
+        const runs = readFileSync(runtime.runLog.path, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+        const layer2 = runs.filter((record) => record.phase === 'layer2');
+        assert.equal(layer2[layer2.length - 1].status, 'OBSERVED');
+        assert.ok(!JSON.stringify(layer2[layer2.length - 1]).includes('先看 would-write 再开 auto'), 'runlog 里不能出现条目正文');
+
+        /* 内部记账与 auto 一致：跨会话游标照常推进 */
+        assert.equal(readCrossCursor(runtime.crossCursorFile).lastRunAt, NOW, '影子档也要推跨会话游标（否则同一批素材每天重跑）');
+
+        /* would-write 有 L2 行 */
+        assert.ok(typeof result.wouldWrite?.file === 'string' && result.wouldWrite.file !== '', 'L2 也要产出影子文件路径');
+        assert.ok(existsSync(wouldWritePath(NOW)), `影子文件必须落盘：${wouldWritePath(NOW)}`);
+        const shadowLines = readFileSync(wouldWritePath(NOW), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+        const layer2Lines = shadowLines.filter((line) => line.layer === 2);
+        assert.ok(layer2Lines.length >= 1, 'would-write 里要有 layer 2 的算子');
+        assert.ok(layer2Lines.some((line) => line.status === 'would-written' && line.content.includes('先看 would-write')), 'L2 的升格候选要落成 would-written');
+        assert.ok(layer2Lines.every((line) => String(line.status).startsWith('would-')));
     }
 } finally {
     cleanup();

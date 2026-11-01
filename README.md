@@ -4,11 +4,12 @@
 只把对话压成 L0 暂存行（**不花 LLM**），攒够 **6 轮 / 8000 字符**（先到先算）才花一次模型
 调用抽成结论式条目，交给主插件 `@dsh-external/dsh-persona-memory/store` 的校验与闸口，
 写进 `JOURNAL.jsonl` / `FACT.md` / 项目 `MEMORY.md`。**撞限只降级 JOURNAL，本插件绝不自己
-压缩 FACT / MEMORY**；默认直接写盘，需要演练时用 `/memory-consolidate dry`。
+压缩 FACT / MEMORY**；默认直接写盘，需要演练时用 `/memory-consolidate dry`（只出报告），
+或用设置页的**运行档位 `observe`**：真跑整条管线，但「写入」换成影子文件。
 
 | | |
 |---|---|
-| 版本 | `0.1.0`（里程碑 **M5**：触发 / 暂存 / 抽取 / 归并 / 跨会话 / 设置页全部接线） |
+| 版本 | `0.1.1`（M5 接线 + **运行档位 off / observe / auto** 与 `would-write` 影子文件） |
 | 许可证 | MIT，见 [LICENSE](./LICENSE) |
 | 依赖 | peer：`@dsh-external/dsh-persona-memory >=0.7.0 <0.9.0`（只调它的 `./store`）、`cordis >=4.0.0-rc <5` |
 | 运行依赖 | `schemastery`（别名安装 `npm:@deepseek-ai/schemastery@3.18.2`） |
@@ -106,12 +107,13 @@ dsh plugin --profile <profile> remove @dsh-external/dsh-persona-memory-consolida
 
 ## 配置
 
-`cordis.patch.yml` 里那一行就是默认值，**29 个键全部与 `Config` schema 一致**
+`cordis.patch.yml` 里那一行就是默认值，**30 个键全部与 `Config` schema 一致**
 （`test/wiring.test.mjs` 逐个比对默认值）：
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
-| `enabled` | `true` | 总开关；关掉即完全静默（L0 也不写） |
+| `enabled` | `true` | 总开关；只在 `auto` 档生效（`off` / `observe` 档以档位为准） |
+| `mode` | `'auto'` | 运行档位：`off`（完全静默，等价 `enabled=false`）/ `observe`（影子：真跑管线但只写 would-write）/ `auto`（正式写入） |
 | `dryRun` | `false` | 干跑：只出报告不落盘。默认关闭；一次性演练用 `/memory-consolidate dry` |
 | `scope` | `'both'` | `journal` = 只写 JOURNAL；`both` = JOURNAL + FACT/MEMORY |
 | `minTurns` | `6` | 消费门槛 · 回合数（与 `minChars` 先到先算） |
@@ -155,12 +157,13 @@ dsh plugin --profile <profile> remove @dsh-external/dsh-persona-memory-consolida
 ## 设置页：记忆 → 自动沉淀
 
 父插件在「设置 → 记忆」页留了扩展点，本插件用 `ctx.personaMemory.settings.register()`
-注册声明式设置项（页面只渲染与回写，值存哪里由本插件决定）。两组、17 项：
+注册声明式设置项（页面只渲染与回写，值存哪里由本插件决定）。两组、18 项：
 主组一眼看到是否开启，高级组在超过 3 项时按页面折叠规则默认收起。
 
 | id | 分组 | 控件 | 默认 | 说明 |
 |---|---|---|---|---|
-| `consolidate.enabled` | 自动沉淀 | 开关 | 开 | 回合结束只写 L0；攒够门槛才花一次 LLM |
+| `consolidate.mode` | 自动沉淀 | 选择 | `auto` | 运行档位：`auto` 正式写入 / `observe` 影子（只写 would-write）/ `off` 完全静默。显式 `off` / `observe` 压过下面的开关，`auto` 才跟随它 |
+| `consolidate.enabled` | 自动沉淀 | 开关 | 开 | 回合结束只写 L0；攒够门槛才花一次 LLM（只在 `auto` 档生效） |
 | `consolidate.crossEnabled` | 自动沉淀 | 开关 | 开 | 跨会话整理 |
 | `consolidate.crossSource` | 自动沉淀 | 选择 | `auto` | 自动 / JOURNAL / 会话检索服务 / 会话文件 |
 | `consolidate.scope` | 自动沉淀 | 选择 | `both` | JOURNAL + FACT/MEMORY / 只写 JOURNAL |
@@ -197,6 +200,7 @@ dsh plugin --profile <profile> remove @dsh-external/dsh-persona-memory-consolida
 | `cursor.json` | 消费游标，按 `${workspaceId}:${sessionId}` 记 `{turn, at, chars}`，**只单调前进**，只在 L1 成功后推进 |
 | `runs.jsonl` | 运行日志：一行一次运行/阶段，字段白名单 + 打码，条目正文一个字都不进；4 MB 滚动、保留 3 份（`.1` / `.2`） |
 | `superseded.jsonl` | 被覆盖的旧值，只审计、不进任何检索 |
+| `would-write/<yyyy-mm-dd>.jsonl` | **影子模式专用**：一行一个「本来会写什么」的算子，含正文与预算预判；按天分文件。`observe` 档不写 FACT / MEMORY / JOURNAL，只写它 |
 | `backups/<runId>/` | 按 runId 分的快照（回滚用，保留 10 份） |
 | `cross-cursor.json` | 第二层游标 `{lastRunAt, lastCount, lastRunId}` |
 | `settings.json` | 设置页覆盖层（只存显式改过的键） |
@@ -218,6 +222,52 @@ dsh plugin --profile <profile> remove @dsh-external/dsh-persona-memory-consolida
 `/memory-consolidate dry`（或配置 `dryRun: true`）时：管线照跑（采样、门槛、预算、抽取、
 裁决、校验都执行），但 writer 对每条只记 `DRY`（`would-journal` / `would-add` / `would-demote`），
 **任何文件都不改**。默认是直接写盘；想先看结论质量，就跑一次 `dry`。
+
+### 影子模式（`mode: observe`）：真跑管线，只把「本来会写什么」落盘
+
+`dry` 是**一次性**的、且报告里看不到正文；想在切 `auto` 之前攒一份可翻看的证据，用档位
+`observe`：
+
+- 管线**一个字都不省**：真采样、真门槛、真调 LLM、真打码、真校验，`store.assertEntry`
+  闸口预演也真跑 —— 所以「本来会撞限」「本来会被模板拒掉」都能提前看到；
+- 但 `insertEntry` / `replaceEntry` / `deleteEntry` / `appendJournal` / `supersedeJournal`
+  **一个都不调**，FACT.md / MEMORY.md / JOURNAL.jsonl 的 SHA256 不变；
+- 结果逐算子写进 `would-write/<yyyy-mm-dd>.jsonl`：
+
+```json
+{"ts":1800000000000,"runId":"run-…","workspaceId":"ws-1","layer":1,"scope":"global",
+ "storeScope":"fact","op":"ADD","target":"","content":"依赖用 tarball 装","status":"would-written",
+ "reason":"ok","confidence":"high","budget":{"scope":"fact","known":true,"authoritative":true,
+ "lines":45,"chars":4261,"bytes":4261,"limit":{"lines":100,"bytes":8000},"predictedLines":46,
+ "predictedChars":4280,"predictedBytes":4280,"exceeded":false,"reason":"ok"}}
+```
+
+  `status` 取值：`would-written` / `would-replaced` / `would-deleted` / `would-journal` /
+  `would-demoted`（撞限或模板判降级）/ `would-dropped` / `would-noop` / `would-failed`。
+  UPDATE / DELETE 没有可预演的只读接口，`reason` 记 `unverified`（预算只是水位预判）。
+- runlog 记 `status: OBSERVED`，**不进**「近 7 天」的成功率 / NOOP 比例 / 字符数 / 降级数，
+  单独显示成「影子 N 次（本来会写 M 条）」；
+- **触发与内部记账和 `auto` 完全一致**：`decideConsume` 门槛、兜底扫描、跨会话日跑都照跑，
+  LLM 花销 ≈ `auto`；暂存行照常 `markConsumed` + 归档、L1 游标与 L2 跨会话游标照常推进；
+- **只有「写入」被替换成 would-write**：`insertEntry` / `replaceEntry` / `deleteEntry` /
+  `appendJournal` / `supersedeJournal` 一个都不调；`supersedeJournal` 只能记成预览条数
+  （真调就是写 JOURNAL 了）；
+- 唯一额外不做的副作用是**记忆文件写前快照**：没写记忆文件，建了只会堆垃圾、也没得回滚；
+- `/memory-consolidate dry` 仍然优先于档位（只出报告，不写影子文件）。
+
+#### 已知取舍：观察期消费的素材，切到 `auto` 后不会补写
+
+影子档的记账与 `auto` 一致，所以同一批暂存行在观察期就被消费/归档、游标也推到了最新。
+切到 `auto` 时，那些回合**不会**被重新抽取写进 FACT —— 这是有意的：
+
+- 不这样做的代价更糟：同一批素材每天被反复采样、反复烧 LLM；切档那一刻还会把观察期攒下的
+  陈旧结论一次性灌进 FACT（backlog 炸弹）；
+- 想「补写」就先 `/memory-consolidate dry`（或 `cross dry`）看一眼结论质量，再决定要不要手工
+  重跑；`dry` 不消费、不推游标，适合当「切 auto 之前的最后一道预览」。
+- 同理，L2 在影子里「本来会失效」的旧 JOURNAL 条目，因游标已推进，切 `auto` 后也不会补失效。
+
+`off` 档等价于 `enabled=false`：L0 不写、兜底扫描空转、手动 `run` / `cross` 会明确拒绝
+（只读的 `status` / `dry` 仍可用）。
 
 ## 回滚 / 卸载
 
@@ -246,7 +296,7 @@ $env:ELECTRON_RUN_AS_NODE='1'
 ## 回归测试
 
 ```powershell
-# 仓库根：20 步 = 1 次 lib/*.js 语法检查 + 19 组单测
+# 仓库根：21 步 = 1 次 lib/*.js 语法检查 + 20 组单测
 pwsh -File test/run-all.ps1
 
 # 也可以单独跑
@@ -258,10 +308,13 @@ node test/redact.test.mjs       # 密钥/手机号/身份证/卡号打码与 dro
 node test/bm25-parity.test.mjs  # 与 recall 真实实现逐位一致（11 条语料 / 8 条查询）
 node test/merger.test.mjs       # 预筛阈值、sanitizeOps 降级、冲突规则
 node test/extractor.test.mjs    # 提示词构造、JSON 解析、候选归一
-node test/writer.test.mjs       # 降级 JOURNAL、dryRun、store 缺失、水位
+node test/writer.test.mjs       # 降级 JOURNAL、dryRun、store 缺失、水位、observe 影子（SHA256 不变 + would-write 正文 + 落盘失败记 FAIL）
+node test/settings.test.mjs     # 数字/字符串项回写、mode 白名单与优先级、覆盖层坏值
 node test/sources.test.mjs      # 三档数据源与降级链、pending 桶列举
-node test/runlog.test.mjs       # 字段白名单、打码、滚动
-node test/autotrigger.test.mjs  # M2：turn/end 写 L0、门槛微任务消费、状态兜底、销毁收尾、兜底扫描、退避
+node test/runlog.test.mjs       # 字段白名单、打码、滚动、影子运行不进真实写入统计
+node test/autotrigger.test.mjs  # M2：turn/end 写 L0、门槛微任务消费、状态兜底、销毁收尾、兜底扫描、退避、observe 与 auto 同口径触发
+node test/pipeline.test.mjs     # L1 闭环：happy path、撞限降级、快照回滚、observe（SHA256 不变 + 记账与 auto 一致）
+node test/crosssession.test.mjs # L2：升格 / 只交 id 失效 / 逐桶 / 预算 / observe（不写盘但推游标，would-write 有 layer 2 行）
 node test/wiring.test.mjs       # 插件形状、Config 默认值、命令路由、设置项、turn/end 真的写 L0
 ```
 
@@ -302,18 +355,19 @@ node test/wiring.test.mjs       # 插件形状、Config 默认值、命令路由
 | `lib/cursor.js` | 路径、游标读写（坏文件当空）、原子写 JSON |
 | `lib/budget.js` | 单飞 + 并发 1 + 日配额 + 退避 + `withTimeout` |
 | `lib/validate.js` | 打码、桶一致性、主插件 store 懒解析与闸口封装 |
-| `lib/writer.js` | 算子执行：写 FACT/MEMORY 或**降级 JOURNAL**；`dryRun` 只记 DRY |
+| `lib/writer.js` | 算子执行：写 FACT/MEMORY 或**降级 JOURNAL**；`dryRun` 只记 DRY；`observe` 只写 `would-write/`（含闸口预演与预算预判） |
+| `lib/mode.js` | 运行档位 `off` / `observe` / `auto` 的唯一口径（含与 `enabled` 的优先级） |
 | `lib/extractor.js` | 抽取/裁决提示词与模型 JSON 解析 |
 | `lib/merger.js` | 预筛（BM25 近邻）、算子校验、冲突规则 |
 | `lib/sources.js` | 第二层三档数据源 + 降级链 + pending 桶列举 |
 | `lib/crosssession.js` | 第二层触发判定、频次升格、逐桶计划 |
-| `lib/runlog.js` | `runs.jsonl` 写入（字段白名单 + 打码 + 滚动） |
+| `lib/runlog.js` | `runs.jsonl` 写入（字段白名单 + 打码 + 滚动）、7 天汇总、影子文件路径 |
 | `lib/settings.js` | 设置页声明式设置项 + 覆盖层持久化与校验 |
 | `lib/milestone.js` | `AUTO_TRIGGER_READY` / `MILESTONE` 里程碑开关（断开 `index ⇄ commands` 循环 import） |
 | `lib/tokenize.js` / `lib/bm25.js` | 分词与 BM25（与 recall 实现逐位一致） |
 | `lib/types/index.d.ts` | 类型声明（只声明包入口真正导出的东西） |
 | `cordis.patch.yml` | 组合包层：把 `persona-memory-consolidate` 一行插进宿主组合 |
-| `test/*.test.mjs` | 19 组回归测试 + `run-all.ps1` |
+| `test/*.test.mjs` | 20 组回归测试 + `run-all.ps1` |
 
 `lib/` 下的 JS **就是源码**，纯 ESM，无构建链。
 

@@ -23,6 +23,7 @@ import {
     readConsolidateOverrides,
     writeConsolidateOverrides,
 } from '../lib/settings.js';
+import { MODE, isConsolidationEnabled, normalizeMode, resolveMode } from '../lib/mode.js';
 import { makeHome } from './_helpers.mjs';
 
 /* ── 1. 字符串项：provider / model 现在写得进去 ── */
@@ -65,6 +66,29 @@ assert.equal(coerceSetting('crossSource', 'journal'), 'journal');
 assert.throws(() => coerceSetting('crossSource', 'nope'), /不接受/);
 assert.throws(() => coerceSetting('没有这个键', 1), /未知的设置项/);
 
+/* ── 3b. 运行档位 mode：只收 off/observe/auto，默认 auto ── */
+assert.equal(coerceSetting('mode', 'off'), MODE.OFF);
+assert.equal(coerceSetting('mode', 'observe'), MODE.OBSERVE);
+assert.equal(coerceSetting('mode', 'auto'), MODE.AUTO);
+assert.equal(coerceSetting('mode', '  OBSERVE  '), MODE.OBSERVE, '去空白 + 小写归一');
+assert.throws(() => coerceSetting('mode', 'shadow'), /不接受/, '没在白名单里的档位必须拒写');
+assert.throws(() => coerceSetting('mode', ''), /不接受/, '空值不是合法档位（默认由 Config 给 auto）');
+assert.equal(normalizeMode('nope'), null);
+assert.equal(normalizeMode(undefined), null);
+
+/* 优先级：显式 off / observe 压过 enabled；auto（默认）才跟随 enabled —— 与改造前一致 */
+assert.equal(resolveMode({}), MODE.AUTO, '没设置档位 ⇒ auto（默认值）');
+assert.equal(resolveMode({ enabled: true }), MODE.AUTO);
+assert.equal(resolveMode({ enabled: false }), MODE.OFF, 'auto 档 + 开关关 ⇒ off（改造前语义）');
+assert.equal(resolveMode({ mode: MODE.AUTO, enabled: false }), MODE.OFF, 'auto 档才跟随开关');
+assert.equal(resolveMode({ mode: MODE.AUTO, enabled: true }), MODE.AUTO);
+assert.equal(resolveMode({ mode: MODE.OBSERVE, enabled: false }), MODE.OBSERVE, '显式 observe 压过开关');
+assert.equal(resolveMode({ mode: MODE.OFF, enabled: true }), MODE.OFF, '显式 off 压过开关');
+assert.equal(resolveMode({ mode: '乱写的档位', enabled: false }), MODE.OFF, '非法档位回落 enabled 语义');
+assert.equal(isConsolidationEnabled({ enabled: false }), false);
+assert.equal(isConsolidationEnabled({ mode: MODE.OBSERVE }), true);
+assert.equal(isConsolidationEnabled({ mode: MODE.OFF }), false);
+
 /* ── 4. spec 元数据自洽：数字项带 numeric，字符串项不带 ── */
 for (const spec of SETTINGS_SPECS) {
     if (spec.kind !== 'text') continue;
@@ -85,6 +109,8 @@ try {
         model: 'deepseek-v4.1-flash',
         minTurns: 10,
         enabled: false,
+        // 档位：覆盖层要能存能读（切到影子后重启仍生效）
+        mode: 'observe',
         // 坏值：读回时应该被丢掉，而不是让整个文件失效
         minChars: '不是数字',
     }, file);
@@ -92,20 +118,27 @@ try {
     const onDisk = JSON.parse(readFileSync(file, 'utf8'));
     assert.equal(onDisk.provider, 'workbuddy-cn', 'provider 必须原样落盘');
     assert.equal(onDisk.model, 'deepseek-v4.1-flash');
+    assert.equal(onDisk.mode, 'observe', 'mode 必须原样落盘');
 
     const overrides = readConsolidateOverrides(file);
     assert.equal(overrides.provider, 'workbuddy-cn');
     assert.equal(overrides.model, 'deepseek-v4.1-flash');
     assert.equal(overrides.minTurns, 10);
     assert.equal(overrides.enabled, false);
+    assert.equal(overrides.mode, MODE.OBSERVE);
     assert.equal(Object.prototype.hasOwnProperty.call(overrides, 'minChars'), false, '坏值跳过，不当成 0 或 NaN');
 
+    /* 坏档位：覆盖层读回时当没设过（一次手改不能让插件按乱写档位跑） */
+    writeConsolidateOverrides({ mode: 'shadow' }, file);
+    assert.deepEqual(readConsolidateOverrides(file), {}, '非法档位读回时被丢掉，回落 auto');
+
     /* 合并进 config：只覆盖设置页管的键 */
-    const config = { provider: '', model: '', minTurns: 6, 不认识的键: 1 };
+    const config = { provider: '', model: '', minTurns: 6, mode: MODE.AUTO, 不认识的键: 1 };
     applyConsolidateOverrides(config, overrides);
     assert.equal(config.provider, 'workbuddy-cn');
     assert.equal(config.model, 'deepseek-v4.1-flash');
     assert.equal(config.minTurns, 10);
+    assert.equal(config.mode, MODE.OBSERVE);
     assert.equal(config.不认识的键, 1, '不认识的键不该被动');
 
     /* 坏文件 / 不存在文件 ⇒ 空覆盖层，不抛 */
@@ -120,6 +153,10 @@ try {
     assert.equal(providerItem.value, 'workbuddy-cn');
     assert.equal(items.find((item) => item.id === 'consolidate.model').value, 'deepseek-v4.1-flash');
     assert.equal(items.find((item) => item.id === 'consolidate.minTurns').value, '10');
+    const modeItem = items.find((item) => item.id === 'consolidate.mode');
+    assert.equal(modeItem.kind, 'select', '档位是 select（页面能切档）');
+    assert.equal(modeItem.value, MODE.OBSERVE, '设置页要显示当前档位');
+    assert.deepEqual(modeItem.options.map((option) => option.value), [MODE.AUTO, MODE.OBSERVE, MODE.OFF]);
     assert.ok(items.every((item) => ['toggle', 'select', 'text', 'readonly'].includes(item.kind)));
 } finally {
     cleanup();

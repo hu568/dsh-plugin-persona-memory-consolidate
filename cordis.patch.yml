@@ -18,6 +18,10 @@
       config:
         # ── 总开关 ──
         enabled: true
+        # 运行档位（P1）：off = 完全静默（等价 enabled=false）/ observe = 真跑管线但只写
+        # would-write 影子文件、不碰 FACT/MEMORY/JOURNAL / auto = 正式写入（默认）。
+        # 显式 off / observe 压过 enabled；auto 才跟随 enabled。
+        mode: auto
         # 干跑：只出报告不落盘。默认关闭；一次性演练用 `/memory-consolidate dry`
         dryRun: false
         # journal = 只写 JOURNAL；both = JOURNAL + FACT/MEMORY
