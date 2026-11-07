@@ -77,8 +77,11 @@ dsh --profile <profile> --dump-config   # 验证：应出现本包的层与 pers
 dsh plugin --profile <profile> remove @dsh-external/dsh-persona-memory-consolidate
 ```
 
-**为什么必须重启**：改的是 `lib/*.js`，DSH 不监听 `node_modules`，且 ESM 有加载缓存；
-只有 `cordis.patch.yml` 有可能热生效。卸载不会删除 `$DSH_HOME/memory/consolidate/`。
+**为什么必须重启**：这句话只针对**改源码**——改的是 `lib/*.js`，DSH 不监听 `node_modules`，且 ESM 有加载缓存；
+只有 `cordis.patch.yml` 有可能热生效。**装包**不需要重启：`dsh plugin add` 写进 profile 的
+`dsh.profile.bundles` 后，运行中的引擎经 HMR 重载该层（父插件 README「装完不用重启，改源码才要重启」，
+DSH `0.2.2-rc.1` 实测）。pnpm 报的 `cordis` peer 缺失可忽略，运行时不解析它。
+卸载不会删除 `$DSH_HOME/memory/consolidate/`。
 
 **装它之前先装主插件 0.7.0+**：本插件不 import 主插件本体，只 `import('@dsh-external/dsh-persona-memory/store')`。
 未装时插件**仍能加载**、命令仍可查状态，但写入阶段一律判 `store-unavailable`（丢，不假装成功）。
