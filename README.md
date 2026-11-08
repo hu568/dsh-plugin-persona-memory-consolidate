@@ -300,6 +300,7 @@ $env:ELECTRON_RUN_AS_NODE='1'
 
 ```bash
 # 一条命令跑全量（Windows / Linux / Android 通用，逐个跑 test/*.test.mjs）
+# 开跑前会自动补齐依赖链接（test/ensure-deps.mjs，缺才补、失败只警告）
 node test/run-all.mjs
 
 # 也可以单独跑
