@@ -298,9 +298,9 @@ $env:ELECTRON_RUN_AS_NODE='1'
 
 ## 回归测试
 
-```powershell
-# 仓库根：21 步 = 1 次 lib/*.js 语法检查 + 20 组单测
-pwsh -File test/run-all.ps1
+```bash
+# 一条命令跑全量（Windows / Linux / Android 通用，逐个跑 test/*.test.mjs）
+node test/run-all.mjs
 
 # 也可以单独跑
 node test/trigger.test.mjs      # L0/消费门槛、中断回合、子代理、总开关
