@@ -124,7 +124,9 @@ assert.throws(() => coerceSetting('未知键', 1), /未知的设置项/);
 /* 运行时：路径全部落在临时 DSH_HOME 下 */
 const { home, cleanup } = makeHome('pmc-wiring');
 try {
-    const runtime = createRuntime({});
+    // 显式屏蔽主插件 store：本用例考的是「store 不可用时诚实降级」，
+    // 不能因为本机恰好装了主插件（link 安装后能解析 ./store）就变成 success。
+    const runtime = createRuntime({}, { resolveStore: async () => null });
     assert.equal(runtime.config.minTurns, 6);
     assert.ok(pendingDir().startsWith(home), `pendingDir 应在 DSH_HOME 内：${pendingDir()}`);
     assert.ok(backupsDir().startsWith(home));
