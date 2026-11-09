@@ -15,9 +15,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createBudget } from '../lib/budget.js';
 import { createCallModel } from '../lib/llm.js';
+import { LLM_TRUNCATED } from '../lib/llm.js';
 import { readCursor } from '../lib/cursor.js';
 import { archivePath, readRows, readUnconsumed } from '../lib/pending.js';
-import { latestRunId, rollbackRun, runAllBuckets, runL1, screenCrossPool, snapshotFiles } from '../lib/pipeline.js';
+import { latestRunId, rollbackRun, runAllBuckets, runL1, screenCrossPool, snapshotFiles, attachImportance, routeByGranularity } from '../lib/pipeline.js';
 import { readLastRun } from '../lib/runlog.js';
 import { NOW, fakeModel, fakeStore, makeHome, makeRuntime, memoryStore, seedRows, sha256 } from './_helpers.mjs';
 
@@ -678,6 +679,176 @@ try {
     const fbFact = readFileSync(fbStore.factPath(), 'utf8');
     assert.ok(fbFact.includes('依赖用 tarball 装，不要用 pnpm install'), '回退后新正文要落盘');
     assert.ok(!fbFact.includes(`${CROSS_OLD} <!-- memory-state`), '没写成新条目就不许出现失效标记');
+
+    /* ══════════ DESIGN v3 §14：结论/细节分层 + importance + layers 观测 ══════════ */
+
+    /* 25. `routeByGranularity()` 纯函数：改判、不丢弃、journal 原样、未知 scope 不动 */
+    const granularInput = [
+        { scope: 'global', content: 'rAF 合并触摸写入', kind: 'detail', importance: 5 },
+        { scope: 'project', content: 'importance 2 也算细节', kind: 'conclusion', importance: 2 },
+        { scope: 'journal', content: '本来就是 JOURNAL 的一次性事件', kind: 'detail', importance: 1 },
+        { scope: 'global', content: '普通结论照旧进 FACT', kind: 'conclusion', importance: 3 },
+        { scope: 'project', content: '两边都踩的低档结论', kind: 'detail', importance: 2 },
+        { scope: 'global', content: '一次性小事', kind: 'conclusion', importance: 1 },
+    ];
+    const granularRouted = routeByGranularity(granularInput);
+    assert.equal(granularRouted.candidates.length, granularInput.length, '分层只改判，绝不丢弃');
+    assert.equal(granularRouted.rerouted, 4, 'detail / importance≤2 各算改判');
+    assert.deepEqual(
+        granularRouted.candidates.map((item) => item.scope),
+        ['journal', 'journal', 'journal', 'global', 'journal', 'journal'],
+    );
+    assert.equal(granularInput[0].scope, 'global', '纯函数不许改入参');
+    assert.equal(granularRouted.candidates[2], granularInput[2], '已判 journal 的原样通过（同一个对象）');
+    assert.equal(granularRouted.candidates[3], granularInput[3], '不用改判的也原样通过');
+    assert.equal(routeByGranularity([{ scope: 'nonsense', kind: 'detail', importance: 1 }]).rerouted, 0, '未知 scope 不动');
+    assert.equal(routeByGranularity([{ scope: 'global', kind: 'detail' }]).rerouted, 1, '缺 importance 但 kind=detail 照样改判');
+    assert.deepEqual(routeByGranularity(), { candidates: [], rerouted: 0 });
+    assert.deepEqual(routeByGranularity(null), { candidates: [], rerouted: 0 });
+
+    /* 26. `attachImportance()`：按 content 回匹配；改写过的正文匹配不上 ⇒ 缺省 3 */
+    const attached = attachImportance(
+        [
+            { op: 'ADD', content: 'A 结论' },
+            { op: 'ADD', content: '模型改写过的正文' },
+            { op: 'UPDATE', content: 'B 结论' },
+        ],
+        [
+            { content: 'A 结论', importance: 5 },
+            { content: 'B 结论', importance: 2 },
+            { content: 'A 结论', importance: 1 }, // 同一正文重复出现：先到先得
+        ],
+    );
+    assert.deepEqual(attached.map((op) => op.importance), [5, 3, 2]);
+    assert.equal(attached[1].content, '模型改写过的正文', '正文一个字都不许改');
+
+    /* 27. 端到端：detail / 低重要性被改判进 JOURNAL，结论照写 FACT，layers 落 runlog */
+    const layerDir = join(home, 'proj-layers');
+    mkdirSync(layerDir, { recursive: true });
+    const layerStore = memoryStore({ home, projectDir: layerDir, factText: '' });
+    const layerRuntime = makeRuntime({
+        store: layerStore,
+        model: fakeModel({
+            extraction: JSON.stringify({
+                memories: [
+                    { scope: 'project', content: 'rAF 合并触摸写入，一帧最多一次', confidence: 'high', kind: 'detail', importance: 5 },
+                    { scope: 'global', content: '跨轮记忆写入必须走同一把写锁', confidence: 'high', kind: 'conclusion', importance: 4 },
+                    { scope: 'global', content: '临时调试时改过一次缓存目录', confidence: 'medium', kind: 'conclusion', importance: 1 },
+                ],
+            }),
+        }),
+        config: { dryRun: false },
+    });
+    seedRows({ bucket: 'ws-layers', sessionId: 'session-layers', count: 6, cwd: layerDir });
+    const layered = await runL1({ runtime: layerRuntime, bucket: { workspaceId: 'ws-layers', path: layerDir }, now: NOW + 240 });
+
+    assert.equal(layered.status, 'OK', `分层后应成功：${layered.status} / ${layered.reason}`);
+    assert.equal(layered.candidates, 3, '改判不是丢弃：3 条候选都进归并');
+    assert.deepEqual(layered.layers, { conclusion: 2, detail: 1, rerouted: 2 }, 'layers 按最终 kind 计数 + 改判条数');
+    assert.equal(layered.calls, 1, '分层是纯函数，不该多花调用');
+    const layerFact = readFileSync(layerStore.factPath(), 'utf8');
+    assert.ok(layerFact.includes('跨轮记忆写入必须走同一把写锁'), '结论照写 FACT');
+    assert.ok(!layerFact.includes('rAF 合并触摸写入'), '实现细节不许占静态槽');
+    assert.ok(!layerFact.includes('临时调试时改过一次缓存目录'), 'importance≤2 不许占静态槽');
+    const layerJournal = readFileSync(layerStore.journalPath(), 'utf8');
+    assert.ok(layerJournal.includes('rAF 合并触摸写入'), '改判的细节必须落 JOURNAL（不丢）');
+    assert.ok(layerJournal.includes('临时调试时改过一次缓存目录'), '低重要性条目也落 JOURNAL');
+    assert.equal(layered.counts.written, 3, '2 条改判 JOURNAL + 1 条 FACT 都算写成（改判不是丢弃）');
+    const layerInsert = layerStore.calls.find((call) => call.name === 'insertEntry').args[1];
+    assert.equal(layerInsert.importance, 70, 'importance 4 ⇒ 70，要交给 store.insertEntry');
+    assert.equal(layerInsert.content, undefined, 'entry 里不许出现 content');
+    const layerLogged = readLastRun({ file: layerRuntime.runLog.path });
+    assert.deepEqual(layerLogged.layers, { conclusion: 2, detail: 1, rerouted: 2 }, 'layers 必须进 runlog（§14.2 只做观测）');
+    assert.equal(layerLogged.calls, 1);
+
+    /* 28. 抽取器的真实调用次数要记账：`calls:2`（截断重试）⇒ runlog 与预算都是 2 */
+    const callDir = join(home, 'proj-calls');
+    mkdirSync(callDir, { recursive: true });
+    const callStore = memoryStore({ home, projectDir: callDir, factText: '' });
+    const callRuntime = makeRuntime({
+        store: callStore,
+        model: fakeModel({}),
+        config: { dryRun: false },
+    });
+    // 单独替换抽取器：模拟「抢救失败 → 降推理等级重试成功」的那一次（calls=2）。
+    callRuntime.extractor = {
+        async extract() {
+            return {
+                ok: true,
+                reason: 'ok',
+                memories: [{ scope: 'global', content: '重试成功这条结论必须落进 FACT', confidence: 'high', kind: 'conclusion', importance: 3 }],
+                ops: [],
+                rejects: [],
+                prompt: '',
+                truncated: true,
+                retry: 'max-tokens',
+                calls: 2,
+            };
+        },
+    };
+    seedRows({ bucket: 'ws-calls', sessionId: 'session-calls', count: 6, cwd: callDir });
+    const counted = await runL1({ runtime: callRuntime, bucket: { workspaceId: 'ws-calls', path: callDir }, now: NOW + 250 });
+    assert.equal(counted.status, 'OK');
+    assert.equal(counted.calls, 2, 'calls 必须来自抽取器的真实记账（不能再写死 1）');
+    assert.equal(callRuntime.budget.snapshot().used.total, 2, '预算要按真实调用数扣：占锁 1 次 + 补扣 1 次');
+    const countedLogged = readLastRun({ file: callRuntime.runLog.path });
+    assert.equal(countedLogged.calls, 2);
+    assert.equal(countedLogged.detail, 'retry:max-tokens', '重试救回来要记 retry:，不能和补括号抢救混为一谈');
+    assert.ok(readFileSync(callStore.factPath(), 'utf8').includes('重试成功这条结论必须落进 FACT'));
+
+    /* 28b. 抢救成功（salvage）与重试（retry）在 detail 里必须能分辨 */
+    const salvageDir = join(home, 'proj-salvage');
+    mkdirSync(salvageDir, { recursive: true });
+    const salvageStore = memoryStore({ home, projectDir: salvageDir, factText: '' });
+    const salvageRuntime = makeRuntime({ store: salvageStore, model: fakeModel({}), config: { dryRun: false } });
+    salvageRuntime.extractor = {
+        async extract() {
+            return {
+                ok: true,
+                reason: 'ok',
+                memories: [{ scope: 'global', content: '补括号救回来的这条结论也要落盘', confidence: 'high', kind: 'conclusion', importance: 3 }],
+                ops: [],
+                rejects: [],
+                prompt: '',
+                truncated: true,
+                salvage: 'max-tokens',
+                calls: 1,
+            };
+        },
+    };
+    seedRows({ bucket: 'ws-salvage', sessionId: 'session-salvage', count: 6, cwd: salvageDir });
+    const salvagedRun = await runL1({ runtime: salvageRuntime, bucket: { workspaceId: 'ws-salvage', path: salvageDir }, now: NOW + 255 });
+    assert.equal(salvagedRun.calls, 1);
+    assert.equal(readLastRun({ file: salvageRuntime.runLog.path }).detail, 'salvage:max-tokens', 'salvage 与 retry 要能分辨');
+
+    /* 29. 抽取失败但已经调了 2 次（重试仍失败）⇒ FAIL 也要按 2 次扣预算 */
+    const retryFailDir = join(home, 'proj-retry-fail');
+    mkdirSync(retryFailDir, { recursive: true });
+    const retryFailStore = memoryStore({ home, projectDir: retryFailDir, factText: '' });
+    const retryFailRuntime = makeRuntime({ store: retryFailStore, model: fakeModel({}), config: { dryRun: false } });
+    retryFailRuntime.extractor = {
+        async extract() {
+            return {
+                ok: false,
+                reason: 'model-error',
+                code: LLM_TRUNCATED,
+                detail: "Error: 模型输出被 max-tokens 截断 · finish.kind=max-tokens · retry:LLM_TRUNCATED",
+                memories: [],
+                ops: [],
+                rejects: [],
+                prompt: '',
+                calls: 2,
+            };
+        },
+    };
+    seedRows({ bucket: 'ws-retry-fail', sessionId: 'session-retry-fail', count: 6, cwd: retryFailDir });
+    const retryFailed = await runL1({ runtime: retryFailRuntime, bucket: { workspaceId: 'ws-retry-fail', path: retryFailDir }, now: NOW + 260 });
+    assert.equal(retryFailed.status, 'FAIL');
+    assert.equal(retryFailed.calls, 2, '失败路径也要认账（重试是真花了钱）');
+    assert.equal(retryFailRuntime.budget.snapshot().used.total, 2, 'FAIL 路径的补扣 budget.charge 必须发生');
+    assert.equal(readLastRun({ file: retryFailRuntime.runLog.path }).calls, 2);
+    assert.equal(readUnconsumed({ pendingDir: retryFailRuntime.pendingDir, bucket: 'ws-retry-fail' }).length, 6, '失败不消费');
+
 } finally {
     cleanup();
 }

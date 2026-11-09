@@ -10,9 +10,9 @@
 
 | | |
 |---|---|
-| 版本 | `0.3.1`（0.3.0：跨池近重复预筛、UPDATE 两段式失效、runlog 水位上限修复；0.3.1：设置页补上 `maxOutputTokens`） |
+| 版本 | `0.4.0`（0.4.0：结论/细节分层 + 重要性、截断重试、访问回写；0.3.2：沉淀调用降推理等级 + 截断抢救 + 助手元描述闸口；0.3.1：设置页补上 `maxOutputTokens`；0.3.0：跨池近重复预筛、UPDATE 两段式失效、runlog 水位上限修复） |
 | 许可证 | MIT，见 [LICENSE](./LICENSE) |
-| 依赖 | peer：`@dsh-external/dsh-persona-memory >=0.7.0 <0.11.0`（只调它的 `./store`）、`cordis >=4.0.0-rc <5` |
+| 依赖 | peer：`@dsh-external/dsh-persona-memory >=0.7.0 <0.12.0`（只调它的 `./store`）、`cordis >=4.0.0-rc <5` |
 | 运行依赖 | `schemastery`（别名安装 `npm:@deepseek-ai/schemastery@3.18.2`） |
 | 平面 | **宿主组合**（`cordis.patch.yml` 插一行，`/memory-consolidate` 对所有预设是全局命令） |
 | 设置页 | 「设置 → 记忆 → 自动沉淀 / 自动沉淀 · 高级」 |
@@ -34,7 +34,9 @@
         （纯本地写，< 1ms，不调用模型，不碰主插件）
   → 门槛：未消费回合 ≥ minTurns(6) 或 未消费字符 ≥ minChars(8000)（先到先算）
   → L1：一次 LLM 抽取（结论式条目，最多 8 条）
-        → **确定性闸口**（gate）：空壳/占位、过程叙述、<8 字、同批重复、状态断言缺时点 → 丢
+        → **确定性闸口**（gate）：空壳/占位、过程叙述、<8 字、同批重复、状态断言缺时点、
+          「助手能/不能做什么」这类服务边界（0.3.2） → 丢
+        → **结论/细节分层**（0.4.0）：kind=detail 或 importance≤2 → **改判 scope=journal**（不丢弃）
         → **跨池近重复预筛**（0.3.0）：与 FACT+MEMORY 条目池比对，exact / ≥0.95 → 丢；其余放行
         → 预筛（BM25 近邻相似度）：完全相同或 ≥0.95 直接 NOOP，<0.45 直接 ADD，中间才裁决
         → 需要裁决的才第二次调用
@@ -51,14 +53,19 @@
 2. **中断回合直接丢**（默认 `partialKeep: false`）；
 3. **单飞 + 全局并发 1** + 每日预算 `dailyLlmBudget`（默认 60，第一层 50 / 第二层 10）。
 
-## 现状（0.3.0）：哪些是真的
+## 现状（0.4.0）：哪些是真的
 
 下表只写**已经接线并有测试**的能力；没接线的会明确标出来，不假装成功。
 
 | 能力 | 状态 |
 |---|---|
 | 采样 / 门槛 / 游标 / 预算 / 打码 / 校验 / 归并 / 写盘 / 降级 / runlog / 跨会话计划 | ✅ 代码 + 单测就位 |
-| **确定性写入闸口**（`lib/gate.js`） | ✅ 抽取结果落盘前过滤空壳 / 过程叙述 / 太短 / 同批重复 / 缺时点；丢了几条按原因进 runlog `gate` 与命令报告 |
+| **确定性写入闸口**（`lib/gate.js`） | ✅ 抽取结果落盘前过滤空壳 / 过程叙述 / 太短 / 同批重复 / 缺时点 / 助手元描述（0.3.2）；丢了几条按原因进 runlog `gate` 与命令报告 |
+| **沉淀调用降推理等级**（0.3.2） | ✅ 默认 `reasoningEffort: low`（宿主默认是 `high`，思考会吃光 `maxOutputTokens`）；按模型 `reasoning.efforts` 自动降级，非推理模型一个键都不传 |
+| **截断抢救**（0.3.2） | ✅ `max-tokens` 时把已收到的正文按**元素边界**补括号解析：完整的那几条照样写入、半条绝不写；救回来的那次 runlog `detail` 记 `salvage:max-tokens` |
+| **截断重试**（0.4.0） | ✅ 抢救不回来时**同 prompt 再调一次**，并请调用侧把推理等级压到模型支持的最低档（`overrides.reasoningEffort`，`llm.js` 按 `model.reasoning.efforts` 校验，绝不盲传）；成功记 `retry:max-tokens`，仍失败按原逻辑 FAIL；开关 `retryOnTruncate`（默认开） |
+| **结论/细节分层 + 重要性**（0.4.0） | ✅ 抽取输出带 `kind` / `importance`；`routeByGranularity()` 把 `kind=detail` 或 `importance≤2` 的候选**改判** `scope=journal`（不丢弃）；`importance` 1–5 映射成 20/35/50/70/90 交给主插件侧车索引；runlog 记 `layers:{conclusion,detail,rerouted}` |
+| **访问回写**（0.4.0） | ✅ `NOOP`（有 target）与成功的 `UPDATE` 调 `store.touchEntries([{scope,id}])`（只写索引）；`typeof` 探测主插件有没有这个 API，没有就跳过、失败静默，绝不把本轮判 FAIL |
 | **跨池近重复预筛**（`screenCrossPool`） | ✅ 0.3.0：归并前与 FACT+MEMORY 条目池比对，只拦 `exact` / `near-duplicate`（≥0.95），`ADJUDICATE` 放行；池空或异常放行，`near-duplicate` 进 runlog `gate` |
 | **UPDATE 两段式失效** | ✅ 0.3.0：先写新条目，成功后才给旧条目标 `superseded`（`by` = 新条目 contentId）；任一步失败回退 `replaceEntry` |
 | **runlog 水位上限** | ✅ 0.3.0：`watermarks.*.limit` 按 `{lines,bytes,chars}` 对象形状透传，不再恒 0 |
@@ -76,9 +83,77 @@
 `gateBatch(..., { enabled: false })` **整批放行**，并且 runlog **不写 `gate` 字段**——
 「闸口没启用」与「启用了但一条都没拦」是两件事，不靠 `dropped:0` 猜。线上误杀时改设置即可，不必改代码。
 
+0.3.2 新增一类闸口原因 `meta-assistant`：`该助手不代用户登录账号` 这种「助手自身能不能做」的
+**当次服务边界**说明，读起来是陈述句、实际换个话题就不成立，却会被糊进 FACT 静态槽每轮注入。
+判定刻意做窄（只认「助手 + 能力/权限动词」）：`该助手运行在 Android 手机的 Ubuntu 环境里` 这类
+环境事实必须放行，不能按「该助手」开头一律拦。
+
 0.3.0 起**跨池近重复预筛也随它一起停**：`gateEnabled: false` 意味着整层确定性过滤整批放行
 （否则「一键放行」名不副实，而且 runlog 不写 `gate` 就看不见被跨池丢掉的条目）。只想单独关
 跨池去重、保留同批去重与空壳过滤时，用 `crossPoolDedup: false`。
+
+## 写入门控（0.4.0）：结论/细节分层、重要性、截断重试、访问回写
+
+契约：`DESIGN-memory-lifecycle.md` v3 §10–§15。三件事各自独立、都能单独关，默认全开。
+三个包各自实现同一套格式，本插件**不 import 主插件源码**，主插件的新 API 一律用
+`typeof store.touchEntries === 'function'` 这类探测，老 store 上行为与 0.3.x 完全一致。
+
+### 抽取输出格式（§14.1）
+
+规则新增 7、8 两条，输出 JSON 每条多两个字段：
+
+```json
+{"memories":[{"scope":"global|project|journal","content":"...","confidence":"high|medium|low","kind":"conclusion|detail","importance":3}]}
+```
+
+- `kind`：`conclusion`（结论/约定/红线）| `detail`（实现细节、一次性发现）；非法 ⇒ `conclusion`；
+- `importance`：1–5（5=核心约定或踩坑红线，4=重要结论，3=一般结论，2=细节，1=一次性小事）；
+  非法 ⇒ 3，越界收敛到 1–5（数字字符串也认）。**两个字段都不参与淘汰**：条目照收，只做路由与排序。
+
+### 结论/细节分层：`routeByGranularity()`
+
+`runL1` 在 `gateBatch()` **之后**、跨池预筛**之前**调用（纯函数、零 LLM、零 IO）：
+
+- `scope ∈ {global, project}` 且（`kind === 'detail'` 或 `importance <= 2`）⇒ **改判** `scope='journal'`；
+- **不丢弃**、不计闸口丢弃：内容照样写，只是不占每轮全量注入的静态槽；
+- 已判 `journal` 的原样通过（不重复计数）；未知 scope 不动（合法性由抽取侧与写入侧各自负责）；
+- 返回 `{ candidates, rerouted }`；runlog 新增 `layers: {conclusion, detail, rerouted}`（只做观测）。
+  `rerouted` 是改判那一步的计数，之后还可能被跨池预筛拦下，所以**不要求与 candidates 相加平账**
+  （要求平账的是闸口的 `kept + dropped = total`）。
+
+### 重要性写入（§14.3）
+
+`writer.entryOf(op)` 增加 `importance`：1–5 → **20 / 35 / 50 / 70 / 90**（非法 ⇒ 50），与
+`{text, confidence}` 一起交给 `store.insertEntry` / `replaceEntry`。主插件 0.11+ 把它写进
+`$DSH_HOME/memory/index.json` 侧车索引（0–100，缺省 50），用于淘汰评分与面板；**老主插件忽略该字段**
+（不报错、不写入），所以正文格式零变化。归并可能改写正文，因此 `importance` 在归并**之后**
+按 `content` 回匹配候选（`attachImportance()`），匹配不上（正文被模型改写）用缺省 3。
+
+### 访问回写（§11）
+
+静态注入是全量的，所以「注入」不构成区分度；真正的「用过」信号来自写入侧：
+
+- `NOOP`（有 `target`）：模型明确说「旧条目已经表达了同样的意思」⇒ 旧条目被重新确认；
+- 成功的 `UPDATE`（两段式或原子替换）：旧条目被引用为改写目标。
+
+两种情况都调 `store.touchEntries([{ scope: 'fact'|'memory', id }])`（scope 用 `toStoreScope` 映射后的
+store 词汇）。**只写索引**：不改正文、不占写锁、`dryRun` 不写；没有 `touchEntries`（主插件 < 0.11）
+就跳过；调用抛错**静默吞掉**，绝不影响本轮结果（索引回写失败绝不能让整批素材不被消费）。
+
+## 截断重试（0.4.0）
+
+`LLM_TRUNCATED` ⇒ 先按元素边界抢救（0.3.2）⇒ 救不回来（或只救出空结果）时：
+
+1. 用**同一份 prompt** 再调一次 `callModel`，请求带 `overrides: { reasoningEffort: 'off' }`；
+2. `llm.js` 在 `prepareCall` 的能力回调里校验：在 `model.reasoning.efforts` 里才用，不在就退
+   `efforts[0]`，连 `efforts` 都没有就**一个键都不传**（绝不盲传 ⇒ 不会 `UNSUPPORTED_REASONING_EFFORT`）；
+3. 成功 ⇒ 正常返回，`truncated=true`、`retry='max-tokens'`、`calls=2`，runlog `detail` 记 `retry:max-tokens`；
+4. 仍失败 ⇒ 按原逻辑 `extract-model-error` FAIL（`detail` 保留**第一次**的 finish 摘要，重试错误码附在末尾）；
+5. 只重试一次；`callTimeoutMs` 每次调用独立计时。
+
+`calls` 现在是**真实调用次数**（正常 1、重试 2、没接线 0）：`pipeline` 的 `calls` 与预算补扣
+（`budget.charge`）都按它记账，不再写死 1——失败路径也一样认账。
+开关 `retryOnTruncate`（默认 `true`，设置页「截断后降推理等级重试」）。
 
 ## 写入门控（0.3.0）：跨池去重 + 两段式失效
 
@@ -149,9 +224,10 @@ DSH `0.2.2-rc.1` 实测）。pnpm 报的 `cordis` peer 缺失可忽略，运行�
 
 **装它之前先装主插件 0.7.0+**：本插件不 import 主插件本体，只 `import('@dsh-external/dsh-persona-memory/store')`。
 未装时插件**仍能加载**、命令仍可查状态，但写入阶段一律判 `store-unavailable`（丢，不假装成功）。
-peer 范围是 `>=0.7.0 <0.11.0`：覆盖主插件 **0.7.x–0.10.x**。0.10.0 起主插件才有
-`store.supersedeEntry`（UPDATE 两段式失效靠它），本插件用特性检测接入：老版本没有这个方法时
-自动回落原子替换，不会报错。
+peer 范围是 `>=0.7.0 <0.12.0`：覆盖主插件 **0.7.x–0.11.x**。0.10.0 起主插件才有
+`store.supersedeEntry`（UPDATE 两段式失效靠它）、0.11.0 起才有 `store.touchEntries`（访问回写靠它）
+与 `insertEntry` 的 `importance` 字段；本插件全部用特性检测接入：老版本没有这些能力时
+自动回落（原子替换 / 跳过回写 / 忽略 importance），不会报错。
 
 ## 命令：`/memory-consolidate`
 
@@ -178,9 +254,9 @@ peer 范围是 `>=0.7.0 <0.11.0`：覆盖主插件 **0.7.x–0.10.x**。0.10.0 �
 
 ## 配置
 
-`cordis.patch.yml` 里那一行就是默认值。`Config` 共 **35 个键**：组合补丁写了其中 **30 个**，
-`gateEnabled` / `crossPoolDedup` / `supersedeOnUpdate` / `maxOutputTokens` / `callTimeoutMs`
-只走 schema 默认值（`test/wiring.test.mjs` 逐个比对 `Config` 默认值）：
+`cordis.patch.yml` 里那一行就是默认值。`Config` 共 **37 个键**：组合补丁写了其中 **30 个**，
+`gateEnabled` / `crossPoolDedup` / `supersedeOnUpdate` / `retryOnTruncate` / `maxOutputTokens` /
+`callTimeoutMs` 只走 schema 默认值（`test/wiring.test.mjs` 逐个比对 `Config` 默认值）：
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
@@ -190,6 +266,7 @@ peer 范围是 `>=0.7.0 <0.11.0`：覆盖主插件 **0.7.x–0.10.x**。0.10.0 �
 | `gateEnabled` | `true` | 确定性写入闸口总开关；`false` = 整批放行，runlog 不写 `gate` 计数（线上误杀时的一键开关）。0.3.0 起跨池近重复也随它一起停 |
 | `crossPoolDedup` | `true` | **0.3.0**：跨池近重复预筛。`false` = 只关这一道（同批去重 / 空壳过滤照旧），归并层自己的池内预筛不受影响 |
 | `supersedeOnUpdate` | `true` | **0.3.0**：UPDATE 先写新条目、成功后才标记旧条目失效；`false` = 只走原子替换。主插件无 `supersedeEntry` 时自动回落替换 |
+| `retryOnTruncate` | `true` | **0.4.0**：截断重试。`LLM_TRUNCATED` 且补括号抢救不回来时，同 prompt 再调一次并把推理等级压到模型支持的最低档；只重试一次，仍失败按原逻辑整次 FAIL |
 | `scope` | `'both'` | `journal` = 只写 JOURNAL；`both` = JOURNAL + FACT/MEMORY |
 | `minTurns` | `6` | 消费门槛 · 回合数（与 `minChars` 先到先算） |
 | `minChars` | `8000` | 消费门槛 · 字符数 |
@@ -206,6 +283,7 @@ peer 范围是 `>=0.7.0 <0.11.0`：覆盖主插件 **0.7.x–0.10.x**。0.10.0 �
 | `maxTurnsPerCall` | `6` | 单次沉淀最多几轮 |
 | `partialKeep` | `false` | 预留：中断回合是否留 partial |
 | `maxOutputTokens` | `8192` | 单次抽取的输出上限（≥256）；0.2.1 起显式传给宿主，不再吃默认值 |
+| `reasoningEffort` | `'low'` | **0.3.2**：沉淀调用的推理等级（`off`/`low`/`high`/`max`，或 `auto`）。宿主对推理模型默认 `high`，会把 `maxOutputTokens` 大半花在思考上 ⇒ `finish=max-tokens` ⇒ `LLM_TRUNCATED`。模型不支持推理时自动丢弃该键，不会失败 |
 | `callTimeoutMs` | `120000` | 单次模型调用超时（≥5000，毫秒）；0.2.2 起超时会真正 abort 底层请求 |
 | `provider` | `''` | LLM provider 覆盖；空 = 沿用会话最近一次 route |
 | `model` | `''` | LLM model 覆盖；空 = 沿用会话最近一次 route |
@@ -256,6 +334,7 @@ peer 范围是 `>=0.7.0 <0.11.0`：覆盖主插件 **0.7.x–0.10.x**。0.10.0 �
 | `consolidate.gateEnabled` | 高级 | 开关 | 开 | 结论质量闸口。关掉即整批放行（跨池近重复也停），runlog 也不再记 `gate` 分类计数 |
 | `consolidate.crossPoolDedup` | 高级 | 开关 | 开 | **0.3.0**：跨池近重复拦截。完全相同或相似度 ≥95% 的结论直接丢弃并计入闸口「跨池近重复」；45%–95% 交给模型裁决；池空或打分异常放行 |
 | `consolidate.supersedeOnUpdate` | 高级 | 开关 | 开 | **0.3.0**：改写走失效标记。先写新正文，成功后才把旧条目标为失效（原文保留可审计、可恢复）；任一步失败回退原子替换 |
+| `consolidate.retryOnTruncate` | 高级 | 开关 | 开 | **0.4.0**：截断后降推理等级重试。输出被 max-tokens 截断且抢救不回来时，用同一份 prompt 再调一次（推理等级压到模型支持的最低档）；只重试一次，仍失败则本次一个字都不写 |
 | `consolidate.pendingMaxAgeDays` | 高级 | 文本 | `30` | 暂存最长保留天数（≥1，整数） |
 | `consolidate.idleScanMinutes` | 高级 | 文本 | `30` | 兜底扫描间隔（≥1，整数） |
 | `consolidate.provider` | 高级 | 文本 | 空 | provider 覆盖（留空 = 沿用会话 route） |
@@ -397,18 +476,18 @@ node test/budget.test.mjs       # 单飞/并发 1/日配额/阶段配额/退避/
 node test/redact.test.mjs       # 密钥/手机号/身份证/卡号打码与 drop
 node test/bm25-parity.test.mjs  # 与 recall 真实实现逐位一致（11 条语料 / 8 条查询）
 node test/merger.test.mjs       # 预筛阈值、sanitizeOps 降级、冲突规则
-node test/extractor.test.mjs    # 提示词构造、JSON 解析、候选归一（不再要模型自报 hits）
-node test/llm.test.mjs          # 宿主 finish 形状、route 继承、codeOf 空码、max-tokens 截断
-node test/writer.test.mjs       # 降级 JOURNAL、demoted 字符串、dryRun、store 缺失、水位、observe 影子、UPDATE 两段式失效与回退
+node test/extractor.test.mjs    # 提示词构造（含规则 7/8）、JSON 解析、候选归一（kind/importance）、截断抢救与重试
+node test/llm.test.mjs          # 宿主 finish 形状、route 继承、codeOf 空码、max-tokens 截断、推理等级能力校验（含 overrides）
+node test/writer.test.mjs       # 降级 JOURNAL、demoted 字符串、dryRun、store 缺失、水位、observe 影子、UPDATE 两段式失效与回退、importance 映射、访问回写（有/无 touchEntries）
 node test/settings.test.mjs     # 数字/字符串项回写、mode 白名单与优先级、crossPoolDedup/supersedeOnUpdate 开关、覆盖层坏值
 node test/sources.test.mjs      # 三档数据源与降级链、pending 桶列举
-node test/runlog.test.mjs       # 字段白名单、打码、滚动、detail/gate、watermarks.limit 对象形状、影子运行不进真实写入统计
+node test/runlog.test.mjs       # 字段白名单、打码、滚动、detail/gate/layers、watermarks.limit 对象形状、影子运行不进真实写入统计
 node test/commands.test.mjs     # status/dry/run/cross/migrate/rollback 文案、抽取路线、上次失败、分桶分裂、跨池近重复标签
 node test/autotrigger.test.mjs  # turn/end 写 L0、门槛微任务消费、状态兜底、销毁收尾、兜底扫描、退避、桶黏性
-node test/pipeline.test.mjs     # L1 闭环：happy path、闸口、跨池近重复（拦截/放行/异常降级）、撞限降级、快照回滚、observe
+node test/pipeline.test.mjs     # L1 闭环：happy path、闸口、跨池近重复、撞限降级、快照回滚、observe、分层路由/layers、importance、按真实 calls 记账
 node test/crosssession.test.mjs # L2：只认真实频次、项目专属不双写 global、只交 id 失效、逐桶、预算、observe
 node test/migrate.test.mjs      # 历史暂存回填：行文件合并、workspaceId 改写、游标取 max
-node test/wiring.test.mjs       # 插件形状、Config 默认值（含 0.3.0 两个新开关）、命令路由、设置项、turn/end 真的写 L0
+node test/wiring.test.mjs       # 插件形状、Config 默认值（含 0.4.0 的 retryOnTruncate）、命令路由、设置项、turn/end 真的写 L0
 ```
 
 不需要 Harness、不需要 profile：全部用例是纯 node，每个用例自带临时 `DSH_HOME`，
@@ -529,6 +608,21 @@ runlog 的 `detail`；`/status` 的「上次失败」直接显示它，并给一
 - **为什么默认不调**：8192 已实测够 6 轮 / 1.6 万字符的桶；调小会让 `finish` 落在 `max-tokens`，
   本次抽取判 `LLM_TRUNCATED` 且一个字都不写——这比「写半截」安全，但丢了一次抽取。
 - **测试**：`test/settings.test.mjs` 的数字项样例表补上该键；22 组用例全绿。
+
+## 变更（0.4.0）：分层、重要性、截断重试、访问回写
+
+- **结论/细节分层**（DESIGN §14）：抽取规则加 7、8 两条；JSON 增加 `kind` / `importance`；
+  `normalizeMemories()` 归一（非法 kind ⇒ `conclusion`、非法 importance ⇒ 3、越界收敛 1–5）；
+  `pipeline.routeByGranularity()` 在闸口之后、跨池预筛之前把 `detail` / `importance≤2` **改判**进 JOURNAL。
+- **重要性**（DESIGN §10/§14.3）：`writer.entryOf()` 带 `importance`（1–5 → 20/35/50/70/90）；
+  `pipeline.attachImportance()` 在归并之后按 content 回填（改写过的正文用缺省 3）。
+- **截断重试**（DESIGN §13）：`LLM_TRUNCATED` 且抢救失败 ⇒ 同 prompt 重试一次、`overrides.reasoningEffort`
+  由 `llm.js` 按模型能力校验；抽取器返回真实 `calls`，预算与 runlog 按它记账（失败路径也补扣）。
+- **访问回写**（DESIGN §11）：`NOOP` / 成功 `UPDATE` 调 `store.touchEntries`（feature-detect、失败静默）。
+- **观测**：runlog 新增 `layers`（`RECORD_FIELDS` 白名单 + `sanitizeRecord` 只留三个数字，未知键漏不进去）；
+  `detail` 能区分 `salvage:max-tokens`（补括号救回来）与 `retry:max-tokens`（重试成功）。
+- **兼容**：主插件没有新字段 / 新方法时写入与 0.3.2 完全一样；peer 上界升到 `<0.12.0`（主插件 0.11.0）。
+  不新增运行时依赖，正文格式（FACT / MEMORY）零变化。
 
 ## 已知边界（0.3.0）
 

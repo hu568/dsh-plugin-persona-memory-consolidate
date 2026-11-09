@@ -71,6 +71,7 @@ const EXPECTED = {
     gateEnabled: true,
     crossPoolDedup: true,
     supersedeOnUpdate: true,
+    retryOnTruncate: true,
     scope: 'both',
     minTurns: 6,
     minChars: 8000,

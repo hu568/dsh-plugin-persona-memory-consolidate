@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+    LAYER_FIELDS,
     RECORD_FIELDS,
     appendRun,
     createRunLog,
@@ -76,6 +77,24 @@ try {
     assert.equal(sanitized.memories, undefined);
     assert.deepEqual(sanitized.counts, { candidates: 1 }, 'counts 只保留白名单子键');
     assert.equal(sanitized.ts, 1);
+
+    /* ── DESIGN §14.2：`layers` 结构化分层计数（只留数字，未知键不漏进去） ── */
+    assert.ok(RECORD_FIELDS.includes('layers'), 'layers 必须在记录白名单里（否则写了也会被丢掉）');
+    assert.deepEqual(LAYER_FIELDS, ['conclusion', 'detail', 'rerouted']);
+    const layered = sanitizeRecord({
+        runId: 'run-layers',
+        layers: { conclusion: 3, detail: 2, rerouted: 1, 未知键: 9, content: '正文不该借道进来' },
+    });
+    assert.deepEqual(layered.layers, { conclusion: 3, detail: 2, rerouted: 1 }, 'layers 只留三个已知数字键');
+    assert.equal(sanitizeRecord({ layers: {} }).layers, undefined, '空 layers 不落盘');
+    assert.equal(sanitizeRecord({ layers: { conclusion: '3' } }).layers, undefined, '字符串不算数字');
+    assert.equal(sanitizeRecord({ layers: { 未知键: 3 } }).layers, undefined, '全是未知键 ⇒ 整块丢掉');
+    assert.equal(sanitizeRecord({ layers: 5 }).layers, undefined, 'layers 不是对象 ⇒ 丢掉（不许把标量当成分层）');
+
+    // 真写一行，确认落盘结果是可消费的形状
+    log.append({ runId: 'run-layers-2', status: 'OK', layers: { conclusion: 4, detail: 1, rerouted: 1 } }, 1_800_000_000_001);
+    const layersLine = JSON.parse(readFileSync(file, 'utf8').trim().split('\n').pop());
+    assert.deepEqual(layersLine.layers, { conclusion: 4, detail: 1, rerouted: 1 });
 
     /* 脱敏：reason 里混了密钥也不许原样落盘 */
     log.append({ runId: 'run-3', reason: 'api_key: abcdef123456 读取失败', status: 'FAIL' });

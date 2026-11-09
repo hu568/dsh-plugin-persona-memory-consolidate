@@ -88,16 +88,18 @@ assert.deepEqual(mixed.counts, {
     [GATE_REASON.UNTIMED_STATE]: 1,
     [GATE_REASON.DUPLICATE]: 1,
     [GATE_REASON.NEAR_DUPLICATE]: 0,
+    [GATE_REASON.META_ASSISTANT]: 0,
 });
 assert.equal(mixed.counts.kept + mixed.counts.dropped, mixed.counts.total, '账必须对得上');
 assert.deepEqual(
     Object.keys(emptyGateCounts()).sort(),
-    ['dropped', 'duplicate', 'empty', 'kept', 'near-duplicate', 'placeholder', 'process', 'too-short', 'total', 'untimed-state'].sort(),
+    ['dropped', 'duplicate', 'empty', 'kept', 'meta-assistant', 'near-duplicate', 'placeholder', 'process', 'too-short', 'total', 'untimed-state'].sort(),
     '空计数形状固定（runlog 白名单按它落盘）',
 );
 /* 新原因只能追加在末尾：runlog 按键顺序落盘，插中间会让新旧日志 diff 全是噪音。 */
 assert.deepEqual(GATE_REASONS, [
     'empty', 'placeholder', 'process', 'too-short', 'untimed-state', 'duplicate', 'near-duplicate',
+    'meta-assistant',
 ]);
 assert.equal(GATE_REASON.NEAR_DUPLICATE, 'near-duplicate', '跨池近重复的原因字符串稳定（runlog 用它做键）');
 assert.deepEqual(gateBatch([]), { kept: [], dropped: [], counts: emptyGateCounts(), total: 0 });
@@ -131,5 +133,29 @@ const original = { content: '依赖用 tarball 装，不要用 pnpm install', sc
 const kept = gateBatch([original]).kept[0];
 assert.equal(kept, original, '必须原样返回，闸口不重建对象');
 assert.equal(kept.confidence, 'high');
+
+/* ── 10. 助手自身的「能不能做」声明：拦（本机 FACT.md 里真实出现过的两条） ── */
+assert.equal(gatePoint('该助手不代用户登录游戏账号。').reason, GATE_REASON.META_ASSISTANT);
+assert.equal(gatePoint('该助手可帮用户查询无需实时交互的奇遇清单及各自挂机时长。').reason, GATE_REASON.META_ASSISTANT);
+assert.equal(gatePoint('助手只支持读写当前工作区内的文件。').reason, GATE_REASON.META_ASSISTANT);
+assert.equal(gatePoint('本助手不会主动联网。').reason, GATE_REASON.META_ASSISTANT);
+assert.equal(gatePoint('- 此助手无法访问手机相册。').reason, GATE_REASON.META_ASSISTANT);
+
+/* 但「该助手运行在 X 环境」这类环境事实必须放行：按「该助手」开头一律拦会误杀真结论 */
+assert.equal(gatePoint('该助手运行在 Android 手机的 Ubuntu 24.04 环境里，没有可用的沙箱后端。').ok, true);
+assert.equal(gatePoint('该助手使用 proot 运行，默认工作目录是 /root/workspace。').ok, true);
+assert.equal(gatePoint('该助手的记忆文件存在 /root/.dsh/memory 下。').ok, true);
+/* 不带「助手」主语、也没有能力动词的普通结论不受影响 */
+assert.equal(gatePoint('用户偏好先给结论再解释。').ok, true);
+
+/* 批量里也只丢这一类，其他照旧保留，账对得上 */
+const metaBatch = gateBatch([
+    '该助手不代用户登录游戏账号。',
+    '依赖用 tarball 装，不要用 pnpm install',
+]);
+assert.equal(metaBatch.counts[GATE_REASON.META_ASSISTANT], 1);
+assert.equal(metaBatch.kept.length, 1);
+assert.equal(metaBatch.kept[0], '依赖用 tarball 装，不要用 pnpm install');
+assert.equal(metaBatch.counts.kept + metaBatch.counts.dropped, metaBatch.counts.total);
 
 console.log('✓ gate.test.mjs 全部通过');

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { wouldWritePath } from '../lib/runlog.js';
-import { appendSuperseded, createWriter, isBudgetExceeded, WRITE_STATUS } from '../lib/writer.js';
+import { appendSuperseded, createWriter, importanceOf, isBudgetExceeded, WRITE_STATUS } from '../lib/writer.js';
 import { NOW, budgetError, fakeStore, makeHome, memoryStore, sha256 } from './_helpers.mjs';
 
 const { home, cleanup } = makeHome('pmc-writer');
@@ -549,6 +549,123 @@ try {
     assert.equal(limitedTwoPhaseResult.results[0].status, WRITE_STATUS.DEMOTED);
     assert.equal(supersedeInsertTried, 0, '闸口说满就别插');
     assert.ok(!limitedTwoPhase.calls.some((call) => call.name === 'supersedeEntry'), '撞限时旧条目绝不能标记失效');
+
+    /* ══════════ DESIGN v3 §14.3：importance 交给主插件（老 store 忽略，行为不变） ══════════ */
+
+    /* 34. 1–5 → 20/35/50/70/90 线性映射；非法 / 缺失 ⇒ 50 */
+    assert.deepEqual([1, 2, 3, 4, 5].map((level) => importanceOf({ importance: level })), [20, 35, 50, 70, 90]);
+    assert.equal(importanceOf({}), 50, '缺失 ⇒ 50（索引缺省档）');
+    assert.equal(importanceOf(null), 50);
+    assert.equal(importanceOf({ importance: '不是数字' }), 50);
+    assert.equal(importanceOf({ importance: Number.NaN }), 50);
+    assert.equal(importanceOf({ importance: 9 }), 90, '越界收敛到 5 档');
+    assert.equal(importanceOf({ importance: 0 }), 20, '越界收敛到 1 档');
+    assert.equal(importanceOf({ importance: '4' }), 70, '数字字符串也认');
+
+    /* 35. ADD / UPDATE 都把 importance 写进 entry（且仍然不带 content 字段） */
+    const importanceStore = fakeStore();
+    const importanceWriter = createWriter({ store: importanceStore.store, supersededFile });
+    const importanceResult = await importanceWriter.apply(
+        [
+            { op: 'ADD', scope: 'global', content: '核心约定：改 lib 后必须重启引擎', confidence: 'high', importance: 5, ts: 1, layer: 1 },
+            { op: 'UPDATE', scope: 'project', target: 'abc1234567', content: '改写后的项目结论', confidence: 'medium', importance: 2, ts: 2, layer: 1, superseded: { id: 'abc1234567', text: '旧的项目结论' } },
+        ],
+        { cwd: 'D:\\proj' },
+    );
+    assert.equal(importanceResult.counts.written, 1);
+    assert.equal(importanceResult.counts.replaced, 1);
+    const importanceInsert = importanceStore.calls.find((call) => call.name === 'insertEntry').args[1];
+    assert.equal(importanceInsert.importance, 90, 'ADD 的 importance 要交给 store.insertEntry');
+    assert.equal(importanceInsert.content, undefined, 'entry 里不许出现 content（主插件只认 text）');
+    const importanceReplace = importanceStore.calls.find((call) => call.name === 'replaceEntry').args[2];
+    assert.equal(importanceReplace.importance, 35, 'UPDATE 的 importance 也要带过去');
+    assert.equal(importanceReplace.text, '改写后的项目结论');
+
+    /* 36. store 有 touchEntries：NOOP（有 target）与成功的 UPDATE 都要回写访问；失败静默 */
+    const touchable = fakeStore({
+        async touchEntries(targets, options) {
+            touchable.calls.push({ name: 'touchEntries', args: [targets, options] });
+            return { touched: targets.length };
+        },
+    });
+    const touchWriter = createWriter({ store: touchable.store, supersededFile });
+    const touched = await touchWriter.apply(
+        [
+            { op: 'NOOP', scope: 'global', target: 'noop123456', content: '已有结论', reason: 'exact' },
+            { op: 'UPDATE', scope: 'global', target: 'upd1234567', content: '改写后的正文', confidence: 'high', ts: 1, layer: 1, superseded: { id: 'upd1234567', text: '旧正文' } },
+            { op: 'ADD', scope: 'global', content: '全新结论一条', confidence: 'high', ts: 2, layer: 1 },
+        ],
+        { cwd: 'D:\\proj' },
+    );
+    assert.equal(touched.counts.noop, 1);
+    assert.equal(touched.counts.replaced, 1);
+    assert.equal(touched.counts.written, 1);
+    assert.equal(touched.counts.failed, 0, '访问回写绝不影响本轮结果');
+    const touchCalls = touchable.calls.filter((call) => call.name === 'touchEntries');
+    assert.equal(touchCalls.length, 2, 'NOOP + UPDATE 各回写一次（ADD 不回写）');
+    assert.deepEqual(touchCalls[0].args[0], [{ scope: 'fact', id: 'noop123456' }], 'scope 用 store 词汇，id 用 op.target');
+    assert.deepEqual(touchCalls[1].args[0], [{ scope: 'fact', id: 'upd1234567' }]);
+
+    /* 37. 回写抛错也静默：状态仍是 NOOP / REPLACED，绝不判 FAIL */
+    const angryTouch = fakeStore({
+        async touchEntries() {
+            throw new Error('index.json 写不进去');
+        },
+    });
+    const angryWriter = createWriter({ store: angryTouch.store, supersededFile });
+    const angryResult = await angryWriter.apply(
+        [
+            { op: 'NOOP', scope: 'project', target: 'noop999999', content: '已有结论', reason: 'near-duplicate' },
+            { op: 'UPDATE', scope: 'project', target: 'upd9999999', content: '改写后的正文', ts: 1, layer: 1, superseded: { id: 'upd9999999', text: '旧正文' } },
+        ],
+        { cwd: 'D:\\proj' },
+    );
+    assert.equal(angryResult.counts.failed, 0, '索引回写失败绝不能让整轮 FAIL');
+    assert.equal(angryResult.counts.noop, 1);
+    assert.equal(angryResult.counts.replaced, 1);
+
+    /* 38. dryRun 不回写（干跑的承诺是一个字节都不落盘） */
+    const dryTouch = fakeStore({
+        async touchEntries(targets) {
+            dryTouch.calls.push({ name: 'touchEntries', args: [targets] });
+            return { touched: 1 };
+        },
+    });
+    const dryTouchResult = await createWriter({ store: dryTouch.store, supersededFile }).apply(
+        [{ op: 'NOOP', scope: 'global', target: 'noop123456', content: '已有结论', reason: 'exact' }],
+        { dryRun: true },
+    );
+    assert.equal(dryTouchResult.counts.noop, 1);
+    assert.ok(!dryTouch.calls.some((call) => call.name === 'touchEntries'), 'dryRun 下不回写索引');
+
+    /* 39. 没有 target 的 NOOP（例如 empty-content）不回写、不炸 */
+    const noTargetTouch = fakeStore({
+        async touchEntries(targets) {
+            noTargetTouch.calls.push({ name: 'touchEntries', args: [targets] });
+            return { touched: 0 };
+        },
+    });
+    const noTargetResult = await createWriter({ store: noTargetTouch.store, supersededFile }).apply(
+        [{ op: 'NOOP', scope: 'global', content: '空正文', reason: 'empty-content' }],
+        {},
+    );
+    assert.equal(noTargetResult.results[0].status, WRITE_STATUS.NOOP);
+    assert.ok(!noTargetTouch.calls.some((call) => call.name === 'touchEntries'));
+
+    /* 40. store 没有 touchEntries（主插件 < 0.11 / 老 store）⇒ 与升级前完全一样，不报错 */
+    const legacy = fakeStore();
+    const legacyResult = await createWriter({ store: legacy.store, supersededFile }).apply(
+        [
+            { op: 'NOOP', scope: 'global', target: 'noop123456', content: '已有结论', reason: 'exact' },
+            { op: 'UPDATE', scope: 'global', target: 'upd1234567', content: '改写后的正文', ts: 1, layer: 1, superseded: { id: 'upd1234567', text: '旧正文' } },
+        ],
+        { cwd: 'D:\\proj' },
+    );
+    assert.equal(legacyResult.counts.noop, 1);
+    assert.equal(legacyResult.counts.replaced, 1);
+    assert.equal(legacyResult.counts.failed, 0);
+    assert.ok(!legacyResult.results.some((item) => item.reason?.includes('touch')), '没有新 API 时不做任何额外动作');
+
 } finally {
     cleanup();
 }

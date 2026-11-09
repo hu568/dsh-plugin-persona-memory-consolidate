@@ -32,6 +32,12 @@ import {
     LLM_TRUNCATED,
     NO_ADAPTER,
     NO_ROUTE,
+    DEFAULT_REASONING_EFFORT,
+    REASONING_EFFORT_AUTO,
+    REASONING_EFFORT_VALUES,
+    configuredReasoningEffort,
+    pickReasoningEffort,
+    pickSupportedReasoningEffort,
 } from '../lib/llm.js';
 
 /** 假 llm 服务：按给定块序列回放，并记录收到的请求。 */
@@ -208,9 +214,138 @@ await assert.rejects(
         getLlm: () => fakeLlm([{ type: 'text-delta', text: '{"memories":' }, { type: 'finish', reason: { kind: 'max-tokens' } }]),
         config: { provider: 'p', model: 'm' },
     })({ prompt: 'x' }),
-    (error) => error.code === LLM_TRUNCATED,
-    '截断的半截 JSON 不许当结论',
+    (error) => error.code === LLM_TRUNCATED && error.text === '{"memories":',
+    '截断的半截 JSON 不许当结论，但已收到的正文必须带出来给抽取侧抢救',
 );
+
+/* ── 9b. 截断时已收到的正文要原样挂在错误上（抢救的唯一原料） ── */
+{
+    let truncated = null;
+    try {
+        await createCallModel({
+            getLlm: () => fakeLlm([
+                { type: 'reasoning', text: '思考不算正文' },
+                { type: 'text-delta', text: '{"memories":[{"scope":"global",' },
+                { type: 'text-delta', text: '"content":"A"}]}' },
+                { type: 'finish', reason: { kind: 'max-tokens' } },
+            ]),
+            config: { provider: 'p', model: 'm' },
+        })({ prompt: 'x' });
+    } catch (error) {
+        truncated = error;
+    }
+    assert.equal(truncated?.code, LLM_TRUNCATED);
+    assert.equal(truncated.text, '{"memories":[{"scope":"global","content":"A"}]}', '只带正文，推理块一个字都不进 text');
+}
+
+/* ── 9c. 推理等级：按模型真实能力挑，拿不准就不传（避免 UNSUPPORTED_REASONING_EFFORT） ── */
+assert.equal(DEFAULT_REASONING_EFFORT, 'low', '沉淀默认 low，不是宿主的 high');
+const reasoningModel = { reasoning: { efforts: [{ id: 'off' }, { id: 'low' }, { id: 'high' }, { id: 'max' }], defaultEffort: 'high' } };
+const offOnlyModel = { reasoning: { efforts: [{ id: 'off' }], defaultEffort: 'off' } };
+const noReasoningModel = { context: { contextWindow: 128000 } };
+
+assert.equal(pickReasoningEffort(reasoningModel, {}), 'low', '默认挑 low');
+assert.equal(pickReasoningEffort(reasoningModel, { reasoningEffort: 'off' }), 'off', '显式配置优先');
+assert.equal(pickReasoningEffort(reasoningModel, { reasoningEffort: 'MAX' }), 'max', '大小写容忍');
+assert.equal(pickReasoningEffort(reasoningModel, { reasoningEffort: 'auto' }), '', 'auto = 一个键都不传');
+assert.equal(pickReasoningEffort(noReasoningModel, {}), '', '非推理模型绝不传 reasoningEffort');
+assert.equal(pickReasoningEffort(offOnlyModel, {}), 'off', '只支持 off 的模型退到 off，而不是硬塞 low');
+assert.equal(pickReasoningEffort(undefined, {}), '', '没有模型信息就不传');
+assert.equal(pickReasoningEffort(reasoningModel, { reasoningEffort: '乱写' }), 'low', '非法值回默认');
+assert.equal(configuredReasoningEffort({}), DEFAULT_REASONING_EFFORT);
+assert.equal(configuredReasoningEffort({ reasoningEffort: ' Auto ' }), REASONING_EFFORT_AUTO);
+assert.deepEqual(REASONING_EFFORT_VALUES, ['off', 'low', 'high', 'max']);
+
+/** 假宿主：模拟 `resolveCallWithInfo`（把 reasoningEffort 解析进 call.config）与 `callConfigEquals`。 */
+function fakeReasoningHost(chunks, model) {
+    const prepared = [];
+    const sent = [];
+    return {
+        prepared,
+        sent,
+        async prepareCall(config, signal, configure) {
+            const controls = configure({}, model);
+            const resolved = {
+                provider: config.provider,
+                model: config.model,
+                maxTokens: config.maxTokens,
+                ...(controls.reasoningEffort === undefined ? {} : { reasoningEffort: controls.reasoningEffort }),
+            };
+            prepared.push({ config, controls, resolved });
+            return {
+                config: resolved,
+                stream(options) {
+                    // 宿主校验：prepared 的每个 config 字段都必须逐字带回来。
+                    for (const [key, value] of Object.entries(resolved)) {
+                        if (options[key] !== value) throw new Error(`INVALID_PREPARED_CALL: ${key}`);
+                    }
+                    sent.push(options);
+                    return (async function* replay() {
+                        for (const chunk of chunks) yield chunk;
+                    })();
+                },
+            };
+        },
+        stream() {
+            throw new Error('不该走回退');
+        },
+    };
+}
+
+const reasoningHost = fakeReasoningHost([{ type: 'text-delta', text: 'ok' }, { type: 'finish', reason: { kind: 'stop' } }], reasoningModel);
+await createCallModel({ getLlm: () => reasoningHost, config: { provider: 'p', model: 'm', maxOutputTokens: 4096 } })({ prompt: 'x' });
+assert.equal(reasoningHost.prepared[0].controls.reasoningEffort, 'low', 'prepareCall 回调里必须注入 low');
+assert.equal(reasoningHost.sent[0].reasoningEffort, 'low', '解析后的 reasoningEffort 要原样带回（宿主 callConfigEquals 校验）');
+assert.equal(reasoningHost.sent[0].maxTokens, 4096);
+
+const autoHost = fakeReasoningHost([{ type: 'finish', reason: { kind: 'stop' } }], reasoningModel);
+await createCallModel({
+    getLlm: () => autoHost,
+    config: { provider: 'p', model: 'm', reasoningEffort: 'auto' },
+})({ prompt: 'x' });
+assert.equal(autoHost.prepared[0].controls.reasoningEffort, undefined, 'auto 时回调里不许出现这个键');
+assert.equal(Object.prototype.hasOwnProperty.call(autoHost.sent[0], 'reasoningEffort'), false, 'auto 时请求里也没有');
+
+const plainHost = fakeReasoningHost([{ type: 'finish', reason: { kind: 'stop' } }], noReasoningModel);
+await createCallModel({ getLlm: () => plainHost, config: { provider: 'p', model: 'm' } })({ prompt: 'x' });
+assert.equal(plainHost.prepared[0].controls.reasoningEffort, undefined, '非推理模型不许塞 reasoningEffort（宿主会抛 UNSUPPORTED_REASONING_EFFORT）');
+assert.equal(Object.prototype.hasOwnProperty.call(plainHost.sent[0], 'reasoningEffort'), false);
+
+/* ── 9d. `overrides.reasoningEffort`（DESIGN §13 截断重试）：意图要过模型能力校验 ── */
+assert.equal(pickSupportedReasoningEffort(reasoningModel, 'off'), 'off', '模型支持就照用');
+assert.equal(pickSupportedReasoningEffort(reasoningModel, 'OFF'), 'off', '大小写容忍');
+assert.equal(pickSupportedReasoningEffort(offOnlyModel, 'max'), 'off', '不支持就退到 efforts[0]，绝不硬塞');
+assert.equal(pickSupportedReasoningEffort(noReasoningModel, 'off'), '', '非推理模型 ⇒ 一个键都不传');
+assert.equal(pickSupportedReasoningEffort(undefined, 'off'), '');
+assert.equal(pickSupportedReasoningEffort(reasoningModel, ''), '', '空串 = 不干预');
+assert.equal(pickSupportedReasoningEffort(reasoningModel, 'auto'), '', 'auto 也交回宿主默认');
+
+const overrideHost = fakeReasoningHost([{ type: 'finish', reason: { kind: 'stop' } }], reasoningModel);
+await createCallModel({ getLlm: () => overrideHost, config: { provider: 'p', model: 'm', reasoningEffort: 'low' } })({
+    prompt: 'x',
+    overrides: { reasoningEffort: 'off' },
+});
+assert.equal(overrideHost.prepared[0].controls.reasoningEffort, 'off', 'overrides 优先于设置页的 low');
+assert.equal(overrideHost.sent[0].reasoningEffort, 'off', '解析后的等级要原样带回（宿主 callConfigEquals）');
+
+const fallbackEffortHost = fakeReasoningHost([{ type: 'finish', reason: { kind: 'stop' } }], offOnlyModel);
+await createCallModel({ getLlm: () => fallbackEffortHost, config: { provider: 'p', model: 'm', reasoningEffort: 'low' } })({
+    prompt: 'x',
+    overrides: { reasoningEffort: 'max' },
+});
+assert.equal(fallbackEffortHost.prepared[0].controls.reasoningEffort, 'off', '模型不支持 max ⇒ 退到它唯一支持的 off');
+
+const overridePlainHost = fakeReasoningHost([{ type: 'finish', reason: { kind: 'stop' } }], noReasoningModel);
+await createCallModel({ getLlm: () => overridePlainHost, config: { provider: 'p', model: 'm' } })({
+    prompt: 'x',
+    overrides: { reasoningEffort: 'off' },
+});
+assert.equal(overridePlainHost.prepared[0].controls.reasoningEffort, undefined, 'overrides 也不能盲传（宿主会抛 UNSUPPORTED_REASONING_EFFORT）');
+assert.equal(Object.prototype.hasOwnProperty.call(overridePlainHost.sent[0], 'reasoningEffort'), false);
+
+const noOverrideHost = fakeReasoningHost([{ type: 'finish', reason: { kind: 'stop' } }], reasoningModel);
+await createCallModel({ getLlm: () => noOverrideHost, config: { provider: 'p', model: 'm' } })({ prompt: 'x', overrides: {} });
+assert.equal(noOverrideHost.prepared[0].controls.reasoningEffort, 'low', 'overrides 里没有该键 ⇒ 仍按设置页配置');
 
 /* ── 10. 继承最近一次真实请求的 route（session.requestHeader → 默认模型） ── */
 const sessionLike = { requestHeader: () => ({ config: { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' } }) };
