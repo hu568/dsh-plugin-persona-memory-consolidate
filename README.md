@@ -10,7 +10,7 @@
 
 | | |
 |---|---|
-| 版本 | `0.3.0`（跨池近重复预筛、UPDATE 两段式失效、runlog 水位上限修复；沿用 0.2.x 的 `gate` / 桶黏性 / L2 去重） |
+| 版本 | `0.3.1`（0.3.0：跨池近重复预筛、UPDATE 两段式失效、runlog 水位上限修复；0.3.1：设置页补上 `maxOutputTokens`） |
 | 许可证 | MIT，见 [LICENSE](./LICENSE) |
 | 依赖 | peer：`@dsh-external/dsh-persona-memory >=0.7.0 <0.11.0`（只调它的 `./store`）、`cordis >=4.0.0-rc <5` |
 | 运行依赖 | `schemastery`（别名安装 `npm:@deepseek-ai/schemastery@3.18.2`） |
@@ -519,6 +519,16 @@ runlog 的 `detail`；`/status` 的「上次失败」直接显示它，并给一
   （跨池拦截与放行、异常降级、两段式成功与回退、开关关闭、limit 对象形状）；
   `test/_helpers.mjs` 的假 store 新增**可选** `supersedeEntry`（默认不挂，老用例仍走替换）。
   仍不新增运行时依赖。
+
+## 变更（0.3.1）：设置页补上「单次抽取输出上限」
+
+- **问题**：`maxOutputTokens` 从 0.2.1 起就是 `Config` 字段、也一直写在本文的设置页表里，
+  但它**没进** `SETTINGS_SPECS` —— 页面从不渲染它，等于「文档说能调、实际调不了」。
+- **修复**：`lib/settings.js` 的「自动沉淀 · 高级」组补上该项（数字项，`min: 256`，`order: 134`），
+  默认 `8192`。改完下一轮生效（`createCallModel` 每次调用现读 `config.maxOutputTokens`）。
+- **为什么默认不调**：8192 已实测够 6 轮 / 1.6 万字符的桶；调小会让 `finish` 落在 `max-tokens`，
+  本次抽取判 `LLM_TRUNCATED` 且一个字都不写——这比「写半截」安全，但丢了一次抽取。
+- **测试**：`test/settings.test.mjs` 的数字项样例表补上该键；22 组用例全绿。
 
 ## 已知边界（0.3.0）
 

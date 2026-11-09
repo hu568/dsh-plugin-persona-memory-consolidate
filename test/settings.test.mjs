@@ -45,6 +45,7 @@ const NUMERIC_INPUTS = {
     maxSampleChars: '9000',
     dailyLlmBudget: '12',
     callTimeoutMs: '120000',
+    maxOutputTokens: '8192',
     pendingMaxAgeDays: '12',
     idleScanMinutes: '12',
 };
