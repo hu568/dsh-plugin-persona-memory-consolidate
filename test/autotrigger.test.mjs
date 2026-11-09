@@ -49,11 +49,17 @@ const REGISTRY = {
 
 const BASE_CONFIG = { enabled: true, dryRun: true, pendingMaxRows: 200, pendingMaxAgeDays: 30 };
 
-/** 假会话：`header` 形状与宿主一致（`delegationDepth` / `cwd`）。 */
+/**
+ * 假会话：`header` 形状与宿主一致（`delegationDepth` / `cwd`）。
+ *
+ * cwd 默认取注册表里该会话所属工作区的路径 —— 0.1.2 起归属**路径优先**，
+ * 夹具里让 cwd 与 sessionIds 一致，才测得出真正的分桶逻辑。
+ */
 function sessionOf(id, events, header = {}) {
+    const workspace = Object.values(REGISTRY.workspaces).find((entry) => entry.sessionIds.includes(id));
     return {
         id,
-        header: { cwd: '/proj/auto', delegationDepth: 0, ...header },
+        header: { cwd: workspace?.path ?? '/proj/auto', delegationDepth: 0, ...header },
         events,
         snapshotEvents() {
             return this.events;
@@ -190,9 +196,9 @@ try {
     const subTrigger = createAutoTrigger({ runtime: subRuntime, now: NOW });
     subTrigger.onSessionEvent(sessionOf('session-sub', subEvents, { delegationDepth: 1 }), turnEnd(1));
     assert.equal(
-        readRows({ pendingDir: subRuntime.pendingDir, bucket: '_unassigned', sessionId: 'session-sub' }).length,
+        readRows({ pendingDir: subRuntime.pendingDir, bucket: 'ws-auto', sessionId: 'session-sub' }).length,
         1,
-        'subagent:true ⇒ 子代理回合也写；未登记的会话落 _unassigned',
+        'subagent:true ⇒ 子代理回合也写；cwd 命中工作区时就按路径归桶（0.1.2 起路径优先）',
     );
 
     /* ── 4. 同一回合的第二个事件 → 不重复写 ── */
@@ -203,6 +209,36 @@ try {
         1,
         '重复投递不许写出第二行',
     );
+
+    /* ── 4b. 会话唯一桶（P1-5）：cwd 丢了也不许把同一会话写进第二个桶 ── */
+    {
+        const splitRuntime = freshRuntime('sticky');
+        const splitTrigger = createAutoTrigger({ runtime: splitRuntime, now: NOW, runConsume: recordingRunner([]) });
+        const splitCounter = { seq: 0 };
+        const splitId = 'session-split-auto';
+        const turn1 = makeTurn({ turn: 1, user: '第一轮的问题', assistant: [LONG_ASSISTANT] }, splitCounter);
+        splitTrigger.onSessionEvent(sessionOf(splitId, turn1, { cwd: '/proj/auto' }), turnEnd(1));
+        assert.equal(readRows({ pendingDir: splitRuntime.pendingDir, bucket: 'ws-auto', sessionId: splitId }).length, 1);
+
+        // 第二轮 cwd 没了（真实故障现场：header.cwd 缺失 / 工作区被改名）⇒ 现算归属变成 _unassigned
+        const turn2 = [...turn1, ...makeTurn({ turn: 2, user: '第二轮的问题', assistant: [LONG_ASSISTANT] }, splitCounter)];
+        splitTrigger.onSessionEvent(sessionOf(splitId, turn2, { cwd: '' }), turnEnd(2));
+
+        assert.equal(
+            readRows({ pendingDir: splitRuntime.pendingDir, bucket: 'ws-auto', sessionId: splitId }).length,
+            2,
+            '第二回合必须沿用旧桶（否则同一对话会被沉淀两次 / 两边都凑不够门槛）',
+        );
+        assert.equal(readRows({ pendingDir: splitRuntime.pendingDir, bucket: '_unassigned', sessionId: splitId }).length, 0, '第二个桶一行都不许有');
+        assert.equal(readCursor(splitRuntime.cursorFile).sessions[`ws-auto:${splitId}`].turn, 2, '游标也记在旧桶键上');
+        const splitLogs = readFileSync(splitRuntime.runLog.path, 'utf8').trim().split('\n')
+            .map((line) => JSON.parse(line))
+            .filter((record) => record.reason === 'bucket-split-adopted');
+        assert.equal(splitLogs.length, 1, '重定向必须留一条 runlog（不能静默）');
+        assert.equal(splitLogs[0].status, 'WARN');
+        assert.ok(String(splitLogs[0].detail).includes(splitId), `WARN 的 detail 要带会话：${splitLogs[0].detail}`);
+        assert.ok(String(splitLogs[0].detail).includes('_unassigned'), 'detail 要说清「现算归属」是什么');
+    }
 
     /* ── 5. 门槛：未达标不排、达标只排一次且不阻塞事件处理器 ── */
     const thrRuntime = freshRuntime('threshold');
@@ -567,6 +603,27 @@ try {
         0,
         'off 档连 L0 都不写',
     );
+
+
+    /* ── 14. 记住「最近一次真实请求」的 route（沉淀继承会话模型） ── */
+    const routeRuntime = freshRuntime('route');
+    const routeEvents = makeTurn({ turn: 1, user: '帮我把结论记下来', assistant: [LONG_ASSISTANT] });
+    const routeSession = sessionOf(SESSION_MAIN, routeEvents);
+    routeSession.requestHeader = () => ({ config: { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' } });
+    const routeTrigger = createAutoTrigger({ runtime: routeRuntime, now: NOW });
+    routeTrigger.onSessionEvent(routeSession, turnEnd(1));
+    assert.deepEqual(routeRuntime.lastRoute, { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' },
+        'requestHeader 的 route 必须被记下（callModel 的 defaults 读它）');
+
+    // requestHeader 读不到时退回事件流里的 request/header
+    const fallbackRuntime = freshRuntime('route-fallback');
+    const fallbackEvents = makeTurn({ turn: 1, user: '再记一次', assistant: [LONG_ASSISTANT] });
+    fallbackEvents.push({ type: 'request/header', seq: 99, data: { header: { config: { provider: 'qianfan', model: 'deepseek-v4.1-flash-1017' } } } });
+    const fallbackSession = sessionOf(SESSION_MAIN, fallbackEvents);
+    delete fallbackSession.requestHeader;
+    createAutoTrigger({ runtime: fallbackRuntime, now: NOW }).onSessionEvent(fallbackSession, turnEnd(1));
+    assert.deepEqual(fallbackRuntime.lastRoute, { provider: 'qianfan', model: 'deepseek-v4.1-flash-1017' },
+        '没有 requestHeader 时从 request/header 事件回读');
 
     /* ── 13. 坏输入不炸（宿主形状变了也不许抛） ── */
     const rough = createAutoTrigger({ runtime: freshRuntime('rough'), now: NOW });

@@ -44,6 +44,7 @@ const NUMERIC_INPUTS = {
     perTurnCap: '1500',
     maxSampleChars: '9000',
     dailyLlmBudget: '12',
+    callTimeoutMs: '120000',
     pendingMaxAgeDays: '12',
     idleScanMinutes: '12',
 };
@@ -62,6 +63,12 @@ assert.throws(() => coerceSetting('minTurns', true), /需要一个数字/);
 /* ── 3. 开关 / 选择项行为不变 ── */
 assert.equal(coerceSetting('enabled', false), false);
 assert.throws(() => coerceSetting('enabled', 'yes'), /只接受开\/关/);
+/* DESIGN §5/§6 的两个新开关：只收布尔（页面回写不会把字符串混进来） */
+assert.equal(coerceSetting('crossPoolDedup', true), true);
+assert.equal(coerceSetting('crossPoolDedup', false), false);
+assert.throws(() => coerceSetting('crossPoolDedup', 'on'), /只接受开\/关/);
+assert.equal(coerceSetting('supersedeOnUpdate', true), true);
+assert.throws(() => coerceSetting('supersedeOnUpdate', 1), /只接受开\/关/);
 assert.equal(coerceSetting('crossSource', 'journal'), 'journal');
 assert.throws(() => coerceSetting('crossSource', 'nope'), /不接受/);
 assert.throws(() => coerceSetting('没有这个键', 1), /未知的设置项/);

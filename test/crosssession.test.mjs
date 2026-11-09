@@ -32,6 +32,7 @@ import {
     countOccurrences,
     mergePromotions,
     parseCrossResponse,
+    promotionConflict,
     readCrossCursor,
     runL2,
     runL2All,
@@ -95,11 +96,42 @@ try {
         { id: 'b', text: '结论：依赖用 tarball 装', session: 's2' },
         { id: 'c', text: '毫无关系的另一句话', session: 's3' },
     ]);
-    assert.equal(occurrences.hits, 2, '按会话去重计次');
-    assert.deepEqual(occurrences.ids, ['a', 'b']);
+    // P1-7：包含匹配要求长度差 ≤ 20%。'依赖用 tarball 装'（12）对 24 字那条差 50% ⇒ 不算命中；
+    // 对 '结论：依赖用 tarball 装'（15）差 20% ⇒ 算命中。旧口径会把两条都算上。
+    assert.equal(occurrences.hits, 1, '短句不再命中明显更长的素材（长度差 > 20%）');
+    assert.deepEqual(occurrences.ids, ['b']);
     assert.equal(occurrences.demotedOnly, false);
     assert.equal(countOccurrences('', []).hits, 0);
     assert.equal(countOccurrences('依赖用 tarball 装', [{ id: 'a', text: '依赖用 tarball 装', tags: ['demoted'] }]).demotedOnly, true);
+    // 归一化相等永远算命中；20% 以内的改写也算
+    assert.equal(countOccurrences('结论：依赖用 tarball 装', [{ id: 'x', text: '依赖用 tarball 装', session: 's1' }]).hits, 1);
+    assert.equal(
+        countOccurrences('依赖用 tarball 装依赖', [{ id: 'x', text: '依赖用 tarball 装依赖呀', session: 's1' }]).hits,
+        1,
+        '长度差 ≤ 20% 的包含仍算同一句',
+    );
+    assert.equal(
+        countOccurrences('重启', [{ id: 'x', text: '重启 DSH 引擎后插件才生效', session: 's1' }]).hits,
+        0,
+        '过短的句子只接受完全相同（否则「重启」能落进任何一句里）',
+    );
+    // P1-6 的纯函数口径：单独一个桶内就够 minHits ⇒ projectBuckets 非空（不许再升格 global）
+    const conflict = promotionConflict('项目专属的结论', [
+        { id: '1', text: '项目专属的结论', session: 's1', workspaceId: 'ws-1' },
+        { id: '2', text: '项目专属的结论', session: 's2', workspaceId: 'ws-1' },
+        { id: '3', text: '项目专属的结论', session: 's3', workspaceId: 'ws-2' },
+    ], { minHits: 2 });
+    assert.deepEqual(conflict.projectBuckets, ['ws-1'], 'ws-1 桶内自己就够 2 次');
+    assert.equal(conflict.hits, 3);
+    assert.deepEqual(conflict.buckets, ['ws-1', 'ws-2']);
+    assert.deepEqual(
+        promotionConflict('跨桶结论', [
+            { id: '1', text: '跨桶结论', session: 's1', workspaceId: 'ws-1' },
+            { id: '2', text: '跨桶结论', session: 's2', workspaceId: 'ws-2' },
+        ], { minHits: 2 }).projectBuckets,
+        [],
+        '每个桶只有一次 ⇒ 是跨桶事实，可以进 global',
+    );
 
     assert.equal(watermarkRatio({ lines: 45, bytes: 4261, limit: { lines: 100, bytes: 8000 } }), 4261 / 8000, '取最高维度');
     assert.equal(watermarkRatio({ lines: 90, bytes: 100, limit: { lines: 100, bytes: 8000 } }), 0.9, '行数超 85% 也算高水位');
@@ -348,6 +380,11 @@ try {
         assert.equal(failed.skipped, 'model-error');
         assert.equal(readCrossCursor(boom.crossCursorFile).lastRunAt, 0, '失败后游标不动（下次重跑）');
         assert.equal(store.calls.filter((call) => call.name === 'insertEntry').length, 0);
+        // L2 失败也要带 detail（模型消息，不是裸错误码）
+        const boomLast = readFileSync(boom.runLog.path, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+            .filter((record) => record.phase === 'layer2').pop();
+        assert.equal(boomLast.reason, 'model-error');
+        assert.ok(String(boomLast.detail).includes('llm 502'), `L2 detail 要含真实错误消息：${boomLast.detail}`);
 
         const invalid = crossRuntime({ store, model: crossModel('我不知道该写什么'), entries });
         const badJson = await runL2({ runtime: invalid, manual: true, now: NOW, dryRun: false });
@@ -478,10 +515,11 @@ try {
             factText: '## 约定\n\n- 已有的结论\n',
             memoryText: '## 结论\n\n1. 项目记忆\n',
         });
-        // 素材：两条同义（凑够 crossPromoteHits=2）的服务条目 + 一条要被试失效的 JOURNAL 条目
+        // 素材：两条同义（跨两个桶凑够 crossPromoteHits=2；同桶内够 2 次属于项目专属，
+        // P1-6 不许再升格 global）+ 一条要被试失效的 JOURNAL 条目
         const entries = [
-            { id: 's1', text: '跨会话的稳定结论：先看 would-write 再开 auto', origin: 'service', session: 'session-1', workspaceId: 'ws-obs' },
-            { id: 's2', text: '跨会话的稳定结论：先看 would-write 再开 auto', origin: 'service', session: 'session-2', workspaceId: 'ws-obs' },
+            { id: 's1', text: '跨会话的稳定结论：先看 would-write 再开 auto', origin: 'service', session: 'session-1', workspaceId: 'ws-obs-a' },
+            { id: 's2', text: '跨会话的稳定结论：先看 would-write 再开 auto', origin: 'service', session: 'session-2', workspaceId: 'ws-obs-b' },
             { id: 'j1', text: '旧的 JOURNAL 结论：依赖用 pnpm install', origin: 'journal', session: 'session-3' },
         ];
         const reply = JSON.stringify({
@@ -538,6 +576,82 @@ try {
         assert.ok(layer2Lines.length >= 1, 'would-write 里要有 layer 2 的算子');
         assert.ok(layer2Lines.some((line) => line.status === 'would-written' && line.content.includes('先看 would-write')), 'L2 的升格候选要落成 would-written');
         assert.ok(layer2Lines.every((line) => String(line.status).startsWith('would-')));
+    }
+    /* ══════════════════════ 15. P1-7：模型自报的 hits 不许绕过频次门槛 ══════════════════════ */
+    {
+        const store = memoryStore({ home, projectDir: join(home, 'proj-claimed'), factText: '## 约定\n\n- 已有的结论\n' });
+        // 素材里这句**只出现过一次**，模型却坚称 hits=5。
+        const entries = [
+            { id: 'j1', text: '只出现过一次的偶然结论', origin: 'journal', session: 'session-1' },
+        ];
+        const model = crossModel(promoteReply([{ scope: 'global', content: '只出现过一次的偶然结论', hits: 5 }]));
+        const runtime = crossRuntime({ store, model, entries });
+
+        const result = await runL2({ runtime, manual: true, now: NOW, dryRun: false });
+        assert.equal(store.calls.filter((call) => call.name === 'insertEntry').length, 0, '自报 hits 不许升格');
+        assert.equal(result.counts.promoted, 0);
+        assert.equal(result.counts.skipped >= 1, true);
+        assert.ok(!readFileSync(store.factPath(), 'utf8').includes('偶然结论'), 'FACT 一个字都不许加');
+    }
+
+    /* ══════════════════════ 16. P1-6：项目专属结论不许同时升格 global ══════════════════════ */
+    {
+        const store = memoryStore({ home, projectDir: join(home, 'proj-double'), factText: '## 约定\n\n- 已有的结论\n' });
+        // 同一句在 ws-1 桶里两个会话各出现一次 ⇒ 对本桶来说已经是稳定事实（project 候选）。
+        const entries = [
+            { id: 's1', text: '项目专属结论不许写进全局事实', origin: 'service', session: 'session-1', workspaceId: 'ws-1' },
+            { id: 's2', text: '项目专属结论不许写进全局事实', origin: 'service', session: 'session-2', workspaceId: 'ws-1' },
+        ];
+        const model = crossModel(promoteReply([{ scope: 'global', content: '项目专属结论不许写进全局事实', hits: 2 }]));
+        const runtime = crossRuntime({ store, model, entries });
+
+        const result = await runL2({ runtime, manual: true, now: NOW, dryRun: false });
+        assert.equal(store.calls.filter((call) => call.name === 'insertEntry').length, 0, '项目专属结论不许写 FACT');
+        assert.equal(result.counts.promoted, 0);
+        assert.ok(
+            (result.skippedDetail ?? []).some((item) => String(item.reason).startsWith('also-project-candidate:ws-1')),
+            `跳过原因要说明是项目候选：${JSON.stringify(result.skippedDetail)}`,
+        );
+        assert.ok(!readFileSync(store.factPath(), 'utf8').includes('项目专属结论'), 'FACT 不许出现这句');
+    }
+
+    /* ══════════════════════ 17. P1-6 端到端：runL2All 里同一句只写一处（MEMORY） ══════════════════════ */
+    {
+        const projectDir = join(home, 'proj-local');
+        mkdirSync(projectDir, { recursive: true });
+        const store = memoryStore({ home, projectDir, factText: '## 约定\n\n- 已有的结论\n', memoryText: '## 结论\n\n1. 项目记忆\n' });
+        appendRow({
+            pendingDir: join(consolidateDir(), 'pending'),
+            bucket: 'ws-local',
+            sessionId: 'session-l1',
+            now: NOW,
+            row: { turn: 1, endedAt: NOW, chars: 10, session: 'session-l1', consumed: true },
+        });
+        const entries = [
+            { id: 's1', text: '只属于这个项目的结论', origin: 'service', session: 'session-l1', workspaceId: 'ws-local' },
+            { id: 's2', text: '只属于这个项目的结论', origin: 'service', session: 'session-l2', workspaceId: 'ws-local' },
+        ];
+        // 跨桶那一段给的 scope 只有 global；逐桶那一段才允许 project —— 同一句会被模型各答一次。
+        const model = crossModel((request) => (String(request?.prompt ?? '').includes('本次允许的 scope：global')
+            ? promoteReply([{ scope: 'global', content: '只属于这个项目的结论', hits: 2 }])
+            : promoteReply([{ scope: 'project', content: '只属于这个项目的结论', hits: 2 }])));
+        const runtime = crossRuntime({
+            store,
+            model,
+            entries,
+            registry: { workspaces: { 'ws-local': { path: projectDir, title: '本地', sessionIds: [] } } },
+        });
+
+        const all = await runL2All({ runtime, manual: true, now: NOW, dryRun: false });
+        const cross = all.runs.find((run) => run.bucket === '');
+        const bucket = all.runs.find((run) => run.bucket === 'ws-local');
+        assert.equal(cross.counts.promoted, 0, '跨桶段不许把它升格成 global');
+        assert.equal(bucket.counts.promoted, 1, '逐桶段写进项目记忆');
+        const fact = readFileSync(store.factPath(), 'utf8');
+        const memory = readFileSync(join(projectDir, 'MEMORY.md'), 'utf8');
+        assert.ok(!fact.includes('只属于这个项目的结论'), 'FACT 里不许出现项目专属结论');
+        assert.ok(memory.includes('只属于这个项目的结论'), '项目 MEMORY 里要有一条');
+        assert.equal(store.calls.filter((call) => call.name === 'insertEntry').length, 1, '同一句只写一次');
     }
 } finally {
     cleanup();

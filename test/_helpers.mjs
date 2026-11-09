@@ -167,6 +167,9 @@ export function consolidateConfig(overrides = {}) {
     return {
         enabled: true,
         dryRun: true,
+        gateEnabled: true,
+        crossPoolDedup: true,
+        supersedeOnUpdate: true,
         scope: 'both',
         minTurns: 6,
         minChars: 8000,
@@ -181,6 +184,8 @@ export function consolidateConfig(overrides = {}) {
         idleScanMinutes: 30,
         dailyLlmBudget: 60,
         maxTurnsPerCall: 6,
+        maxOutputTokens: 2048,
+        callTimeoutMs: 120000,
         partialKeep: false,
         provider: '',
         model: '',
@@ -222,7 +227,10 @@ function normalizeEntryText(text) {
  *   factText?: string,
  *   memoryText?: string,
  *   budgetExceeded?: string[],
+ *   supersede?: boolean,
  * }} options
+ *   `supersede: true` 才挂 `supersedeEntry`（与主插件 0.10+ 一致）：**默认不挂**，
+ *   这样既有用例仍然走 `replaceEntry` 的旧路径，新路径由专门用例显式打开。
  */
 export function memoryStore(options = {}) {
     const home = options.home;
@@ -320,6 +328,42 @@ export function memoryStore(options = {}) {
             calls.push({ name: 'deleteEntry', args: [scope, id] });
             return { deleted: false };
         },
+        /*
+         * 失效标记（主插件 0.10+ 的 `supersedeEntry` 形状）：**只加行尾注释、不改正文、
+         * 不删行**（DESIGN §1/§2）。默认不挂——既有用例要维持 `replaceEntry` 的旧行为，
+         * 新链路由专门用例 `supersede: true` 显式打开。
+         */
+        ...(options.supersede === true ? {
+            supersedeEntry(scope, target, context) {
+                calls.push({ name: 'supersedeEntry', args: [scope, target, context] });
+                if (state.budgetExceeded.has(scope)) throw budgetError(`MEMORY_BUDGET_EXCEEDED: ${scope} 超限`);
+                const file = fileOf(scope);
+                const current = file === null ? null : readText(file);
+                if (current === null) return { ok: false, reason: 'not-found' };
+                const lines = current.split('\n');
+                const wantedId = typeof target?.id === 'string' ? target.id : '';
+                const wantedText = typeof target?.text === 'string' ? target.text.trim() : '';
+                let hit = -1;
+                lines.forEach((line, index) => {
+                    const entry = /^\s*(?:-\s+|\d+[.、]\s+)(.+)$/u.exec(line);
+                    if (entry === null) return;
+                    const text = entry[1].trim();
+                    if (wantedId !== '' && entryId('', text) === wantedId) hit = index;
+                    else if (wantedId === '' && wantedText !== '' && text === wantedText) hit = index;
+                });
+                if (hit < 0) return { ok: false, reason: 'not-found' };
+                const since = new Date(NOW).toISOString().slice(0, 10);
+                const by = String(context?.by ?? '');
+                lines[hit] = `${lines[hit]} <!-- memory-state: status=superseded by=${by} since=${since} -->`;
+                writeText(file, lines.join('\n'));
+                return {
+                    ok: true,
+                    path: file,
+                    entry: { line: hit, text: wantedText, state: { status: 'superseded', by, since } },
+                    revision: '',
+                };
+            },
+        } : {}),
         async appendJournal(text, tags) {
             calls.push({ name: 'appendJournal', args: [text, tags] });
             const line = JSON.stringify({ ts: new Date(NOW).toISOString(), tags: tags ?? [], text: String(text ?? '') });

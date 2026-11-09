@@ -19,6 +19,10 @@ import {
     bucketInfo,
     defaultRegistryPath,
     loadRegistry,
+    normalizePath,
+    pathWithin,
+    resolveRowsWorkspace,
+    workspaceForPath,
     workspaceForSession,
 } from '../lib/workspace.js';
 import { makeHome } from './_helpers.mjs';
@@ -114,6 +118,46 @@ try {
     assert.deepEqual(bucketInfo(shaped, 'ws-已删除'), { workspaceId: 'ws-已删除', title: '', path: '' }, '注册表里没有 ⇒ 空 path（project 条目会被闸口拦下）');
     assert.deepEqual(bucketInfo(shaped, ''), { workspaceId: '_unassigned', title: UNASSIGNED_TITLE, path: '' });
     assert.deepEqual(bucketInfo(shaped, 'ws-1', { unassigned: '_orphan' }).title, '项目一');
+
+
+    /* ── 路径优先归属（0.1.2）：会话没登记也能归对桶 ── */
+    const pathReg = {
+        workspaces: {
+            'ws-root': { path: '/proj', title: '根项目', sessionIds: [] },
+            'ws-app': { path: '/proj/app', title: '子项目', sessionIds: [] },
+            'ws-other': { path: '/other', title: '别处', sessionIds: [] },
+        },
+    };
+    assert.deepEqual(workspaceForPath(pathReg, '/proj/app/src'), { workspaceId: 'ws-app', title: '子项目', path: '/proj/app' }, '最长前缀优先');
+    assert.deepEqual(workspaceForPath(pathReg, '/proj/app'), { workspaceId: 'ws-app', title: '子项目', path: '/proj/app' });
+    assert.deepEqual(workspaceForPath(pathReg, '/proj/app-2'), { workspaceId: 'ws-root', title: '根项目', path: '/proj' }, '按分隔符判边界');
+    assert.equal(workspaceForPath(pathReg, '/projectX'), null, '/proj 不能匹配 /projectX');
+    assert.equal(workspaceForPath(pathReg, ''), null);
+    assert.equal(workspaceForPath({ workspaces: {} }, '/proj'), null);
+
+    assert.deepEqual(
+        bucketForSession(pathReg, 'session-never-registered', { cwd: '/proj/app/src' }),
+        { workspaceId: 'ws-app', title: '子项目', path: '/proj/app' },
+        '名单里没有这个会话，按 cwd 也能归对桶（本机 5/6 未分组的根因）',
+    );
+    const conflict = { workspaces: { 'ws-root': { path: '/proj', title: '根', sessionIds: ['s1'] }, 'ws-app': { path: '/proj/app', title: '子', sessionIds: [] } } };
+    assert.equal(bucketForSession(conflict, 's1', { cwd: '/proj/app' }).workspaceId, 'ws-app', '路径优先于 sessionIds');
+    assert.equal(bucketForSession(pathReg, 'session-x', { cwd: '/nowhere' }).workspaceId, '_unassigned', '两边都对不上 ⇒ 未分组');
+
+    assert.deepEqual(
+        resolveRowsWorkspace(pathReg, [{ cwd: '/proj/app/a' }, { row: { cwd: '/proj/app/b' } }]),
+        { workspaceId: 'ws-app', title: '子项目', path: '/proj/app' },
+        '同一工作区的多行（含 {row} 包装）⇒ 可以写项目记忆',
+    );
+    assert.equal(resolveRowsWorkspace(pathReg, [{ cwd: '/proj/app/a' }, { cwd: '/other/b' }]), null, '混桶不猜');
+    assert.equal(resolveRowsWorkspace(pathReg, [{ cwd: '/nowhere/a' }]), null, '解析不出工作区 ⇒ 不写项目记忆');
+    assert.equal(resolveRowsWorkspace(pathReg, []), null);
+
+    assert.equal(normalizePath('D:\\p1\\'), 'D:/p1', '反斜杠/尾部斜杠归一');
+    assert.equal(normalizePath('/'), '/');
+    assert.equal(pathWithin('/a', '/a/b'), true);
+    assert.equal(pathWithin('/a', '/ab'), false);
+    assert.equal(pathWithin('/', '/any'), true);
 
     /* ── project 断言：`_unassigned` 不许产出 project 记忆 ── */
     assert.deepEqual(assertProjectScope('project', 'ws-1'), { ok: true, reason: 'ok' });

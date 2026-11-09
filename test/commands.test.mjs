@@ -17,7 +17,8 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createCommands, renderRunResult, verdictOf } from '../lib/commands.js';
 import { createExtractor } from '../lib/extractor.js';
-import { readUnconsumed } from '../lib/pending.js';
+import { appendRow, readUnconsumed } from '../lib/pending.js';
+import { createRunLog } from '../lib/runlog.js';
 import { NOW, fakeModel, makeHome, makeRuntime, memoryStore, seedRows, sha256 } from './_helpers.mjs';
 
 const EXTRACTION = JSON.stringify({
@@ -161,6 +162,93 @@ try {
     assert.equal(prepareFailed.kind, 'error');
     assert.ok(prepareFailed.text.includes('模型接线失败'));
 
+    /* ── 诊断行：抽取路线（真实来源）/ 上次失败 detail / 分桶分裂 ── */
+    seedRows({ pendingDir: runtime.pendingDir, bucket: 'ws-clue', sessionId: 'session-split-cmd', count: 1 });
+    // 同一个会话再硬写进第二个桶（sticky:false）⇒ 制造历史遗留的分裂现场
+    appendRow({
+        pendingDir: runtime.pendingDir,
+        bucket: 'ws-clue-2',
+        sessionId: 'session-split-cmd',
+        sticky: false,
+        now: NOW + 1,
+        row: { turn: 2, endedAt: NOW + 1, chars: 10, consumed: false },
+    });
+    runtime.lastRoute = { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' };
+    runtime.probeLlm = () => 'ok';
+    runtime.readDefaultRoute = () => null;
+    runtime.runLog.append({
+        phase: 'layer1',
+        status: 'FAIL',
+        reason: 'extract-model-error:LLM_FINISHED_ABORTED',
+        detail: "Error: 模型调用未正常结束（error） · finish.kind=error failure.code=''",
+        durationMs: 20_500,
+    }, NOW + 2);
+
+    const diagnosed = await commands.handle({ rawInput: 'status' });
+    assert.equal(diagnosed.kind, 'success');
+    assert.ok(
+        diagnosed.text.includes('抽取路线：workbuddy-cn/deepseek-v4.1-flash（来源：会话 route） · llm 服务：在位'),
+        `抽取路线要写出真实来源：${diagnosed.text}`,
+    );
+    assert.ok(diagnosed.text.includes('上次失败：'), 'status 要有「上次失败」一行');
+    assert.ok(diagnosed.text.includes('耗时 20.5s'), `上次失败要显示耗时：${diagnosed.text}`);
+    assert.ok(diagnosed.text.includes('runlog 今日发起'), `今日调用要区分发起次数：${diagnosed.text}`);
+    assert.ok(/runlog 今日发起 \d+ 次 \/ 成功 \d+ 次/u.test(diagnosed.text) || diagnosed.text.includes('runlog 今日发起'),
+        '要同时给出发起与成功');
+    assert.ok(diagnosed.text.includes('进程内'), '要区分进程内配额与 runlog 真账');
+    assert.ok(diagnosed.text.includes('extract-model-error:LLM_FINISHED_ABORTED'), '上次失败要带错误码');
+    assert.ok(diagnosed.text.includes("failure.code=''"), '上次失败要带真实 detail（finish 形状）');
+    assert.ok(
+        diagnosed.text.includes('宿主返回了非正常结束块（不是路线没接上）'),
+        `finish 形状的失败要与「路线没接上」区分开：${diagnosed.text}`,
+    );
+    // 反例：路线没接上时给的是另一种解释（同一个 status 行能分辨两类故障）
+    runtime.runLog.append({
+        phase: 'layer1',
+        status: 'FAIL',
+        reason: 'extract-model-error:NO_ROUTE',
+        detail: 'Error: 没有可用的 provider/model（设置页与会话 route 都是空）',
+    }, NOW + 3);
+    const noRoute = await commands.handle({ rawInput: 'status' });
+    assert.ok(noRoute.text.includes('路线没接上（设置页与宿主默认都空）'), `NO_ROUTE 要有对应解释：${noRoute.text}`);
+    assert.ok(!noRoute.text.includes('宿主返回了非正常结束块'), '此时不该再说是 finish 的问题');
+
+    // 旧格式记录（没有 detail 字段，本机真实 runs.jsonl 就是这种）：照样显示，不许抛
+    runtime.runLog.append({ phase: 'layer1', status: 'FAIL', reason: 'extract-model-error' }, NOW + 4);
+    const legacy = await commands.handle({ rawInput: 'status' });
+    assert.equal(legacy.kind, 'success', `旧格式 FAIL 记录不许让 status 失败：${legacy.text}`);
+    assert.ok(legacy.text.includes('上次失败：'), legacy.text);
+    assert.ok(legacy.text.includes('extract-model-error'), legacy.text);
+    assert.ok(legacy.text.includes('无 detail：旧记录'), `旧记录要说清没有 detail：${legacy.text}`);
+    assert.ok(!legacy.text.includes('undefined'), '缺字段不许在输出里留 undefined');
+    assert.ok(diagnosed.text.includes('分桶分裂：'), '同一个会话在两个桶里 ⇒ status 必须告警');
+    assert.ok(diagnosed.text.includes('session-split-cmd'), `告警要指出会话：${diagnosed.text}`);
+    assert.ok(diagnosed.text.split('\n').length <= 25, `status 仍要在 25 行内：${diagnosed.text.split('\n').length} 行`);
+
+    // 路线拿不到时写「未知」，绝不编造
+    const cluelessRuntime = makeRuntime({ store, model });
+    cluelessRuntime.pendingDir = join(home, 'pending-clueless');
+    const clueless = await createCommands(cluelessRuntime).handle({ rawInput: 'status' });
+    assert.ok(clueless.text.includes('抽取路线：未知'), `拿不到 route 要如实说未知：${clueless.text}`);
+    assert.ok(clueless.text.includes('llm 服务：未知'), '探针缺失时 llm 服务也要写未知');
+
+    /* ── 预算口径：进程内 0/60 但 runlog 今天真发起过 ⇒ 必须提示「重启归零」 ── */
+    const restartRuntime = makeRuntime({ store, model });
+    restartRuntime.pendingDir = join(home, 'pending-restart');
+    // 独立 runlog：模拟「重启后的新进程」——进程内预算从 0 起，但磁盘上有今天的失败记录。
+    restartRuntime.runLog = createRunLog({ file: join(home, 'consolidate', 'restart.jsonl') });
+    restartRuntime.runLog.append({
+        phase: 'layer1', status: 'FAIL', reason: 'extract-model-error:LLM_TIMEOUT',
+        detail: 'Error: 模型调用超时（120000ms）', calls: 1, durationMs: 120_000,
+    });
+    const restarted = await createCommands(restartRuntime).handle({ rawInput: 'status' });
+    assert.equal(restarted.kind, 'success');
+    assert.ok(restarted.text.includes('进程内 0/60'), `全新进程预算应为 0：${restarted.text}`);
+    assert.ok(restarted.text.includes('runlog 今日发起 1 次'), `runlog 要显示真实发起次数：${restarted.text}`);
+    assert.ok(restarted.text.includes('成功 0 次'), '成功次数为 0');
+    assert.ok(restarted.text.includes('重启归零'), `两者不一致时要解释原因：${restarted.text}`);
+    assert.ok(restarted.text.includes('耗时 2.0min') || restarted.text.includes('耗时 120.0s'), `上次失败要显示耗时：${restarted.text}`);
+
     /* ── 运行档位（P1）：status 要显示档位；off 档拒绝正式写入；observe 跑影子 ── */
     assert.ok(status.text.includes('运行档位：正式写入（auto）'), `status 要显示当前档位：${status.text}`);
 
@@ -203,6 +291,19 @@ try {
     assert.equal(verdictOf({ runs: [{ skipped: 'below-threshold' }] }), 'success');
     assert.equal(verdictOf({ runs: [{ status: 'OK' }] }), 'success');
     assert.ok(renderRunResult({ runId: 'r1', dryRun: true, skipped: 'empty', runs: [] }, true).includes('没有待沉淀'));
+    // 闸口丢弃要在运行报告里分类可见（不能静默）
+    const gateReport = renderRunResult({
+        runId: 'r1',
+        runs: [{
+            bucket: 'ws-gate', turns: 6, chars: 100, candidates: 1, ops: 1, calls: 1,
+            counts: { written: 1 },
+            gate: { total: 5, kept: 1, dropped: 4, placeholder: 1, 'too-short': 1, duplicate: 1, 'near-duplicate': 1 },
+        }],
+    }, false);
+    assert.ok(gateReport.includes('闸口丢弃 4 条'), gateReport);
+    assert.ok(gateReport.includes('占位/空壳 1'), gateReport);
+    assert.ok(gateReport.includes('同批重复 1'), gateReport);
+    assert.ok(gateReport.includes('跨池近重复 1'), gateReport);
 
     /* ── 冒烟：命令不会悄悄把 pending 目录建到别处 ── */
     assert.ok(runtime.pendingDir.startsWith(home));

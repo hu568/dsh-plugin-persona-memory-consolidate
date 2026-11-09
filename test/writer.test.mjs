@@ -305,6 +305,250 @@ try {
     const dryShadow = await createWriter({ store: dryWinStore.store, supersededFile, mode: 'observe' }).apply([OP_ADD], { dryRun: true, now: NOW });
     assert.equal(dryShadow.results[0].status, WRITE_STATUS.DRY, 'dryRun 优先于 observe');
     assert.equal(dryShadow.wouldWrite, null);
+
+    /* ══════════ P0-2：store 的 demoted 是**字符串**，不能按 `=== true` 判 ══════════ */
+
+    /* 20. `{written:false, demoted:'drop'}` ⇒ FAILED（带 store 的 reason），绝不算 written */
+    const rejectStore = fakeStore({
+        async insertEntry(scope, entry) {
+            rejectStore.calls.push({ name: 'insertEntry', args: [scope, entry] });
+            return { written: false, demoted: 'drop', reason: '行内代码 3 处（>2）' };
+        },
+    });
+    const rejected = await createWriter({ store: rejectStore.store, supersededFile }).apply([OP_ADD], { cwd: 'D:\\proj' });
+    assert.equal(rejected.results[0].status, WRITE_STATUS.FAILED, '被拒条目绝不许记成 written');
+    assert.equal(rejected.counts.written, 0, 'counts.written 必须是 0（否则 pipeline 会消费掉回合）');
+    assert.equal(rejected.counts.failed, 1);
+    assert.ok(rejected.results[0].reason.includes('行内代码'), `reason 要带 store 给的原因：${rejected.results[0].reason}`);
+    assert.ok(!rejectStore.calls.some((call) => call.name === 'appendJournal'), 'demoted:drop 不写 JOURNAL');
+
+    /* 21. `{written:false, demoted:'journal'}` ⇒ 补写一次 JOURNAL、记 DEMOTED、不算 failed */
+    const journalDemoteStore = fakeStore({
+        async insertEntry(scope, entry) {
+            journalDemoteStore.calls.push({ name: 'insertEntry', args: [scope, entry] });
+            return { written: false, demoted: 'journal', reason: '问句（请改写成陈述句）' };
+        },
+    });
+    const journalDemoted = await createWriter({ store: journalDemoteStore.store, supersededFile }).apply([OP_ADD], { cwd: 'D:\\proj' });
+    assert.equal(journalDemoted.results[0].status, WRITE_STATUS.DEMOTED, '字符串 journal 也算降级');
+    assert.equal(journalDemoted.counts.demoted, 1);
+    assert.equal(journalDemoted.counts.failed, 0, '降级进 JOURNAL 属于写成了（行可以消费）');
+    assert.equal(journalDemoted.counts.written, 0, '没进 FACT 就不许记 written');
+    const journalCalls = journalDemoteStore.calls.filter((call) => call.name === 'appendJournal');
+    assert.equal(journalCalls.length, 1, '字符串 journal 必须真的写一次 JOURNAL');
+    assert.equal(journalCalls[0].args[0], OP_ADD.content, 'JOURNAL 里写的是本条正文');
+
+    /* 22. `{written:false}` 且**没有** demoted 字段 ⇒ FAILED，reason 带 store 的 reason */
+    const silentStore = fakeStore({
+        async insertEntry(scope, entry) {
+            silentStore.calls.push({ name: 'insertEntry', args: [scope, entry] });
+            return { written: false, reason: 'no-project-memory' };
+        },
+    });
+    const silent = await createWriter({ store: silentStore.store, supersededFile }).apply([OP_ADD], { cwd: 'D:\\proj' });
+    assert.equal(silent.results[0].status, WRITE_STATUS.FAILED, '没写成就不是成功');
+    assert.equal(silent.counts.written, 0);
+    assert.equal(silent.results[0].reason, 'store-not-written:no-project-memory');
+
+    /* 23. UPDATE 被降级成 journal：不再误判 not-found 降级 ADD（P0-2 分支 2） */
+    const updateDemoted = fakeStore({
+        async replaceEntry(scope, id, entry, options) {
+            updateDemoted.calls.push({ name: 'replaceEntry', args: [scope, id, entry, options] });
+            return { written: false, demoted: 'journal', reason: '过程词「然后」' };
+        },
+    });
+    const updatedDemoted = await createWriter({ store: updateDemoted.store, supersededFile }).apply([OP_UPDATE], { cwd: 'D:\\proj' });
+    assert.equal(updatedDemoted.results[0].status, WRITE_STATUS.DEMOTED);
+    assert.ok(!updateDemoted.calls.some((call) => call.name === 'insertEntry'), '降级不是 not-found，绝不许再走 ADD');
+    assert.equal(updateDemoted.calls.filter((call) => call.name === 'appendJournal').length, 1);
+    assert.equal(updatedDemoted.counts.failed, 0);
+
+    /* 24. 普通异常也要带真实原因（不再只有 'error'） */
+    const codedStore = fakeStore({
+        async insertEntry() {
+            const error = new Error('锁超时');
+            error.code = 'MEMORY_LOCK_TIMEOUT';
+            throw error;
+        },
+    });
+    const coded = await createWriter({ store: codedStore.store, supersededFile }).apply([OP_ADD], { cwd: 'D:\\proj' });
+    assert.equal(coded.results[0].status, WRITE_STATUS.FAILED);
+    assert.equal(coded.results[0].reason, 'MEMORY_LOCK_TIMEOUT', '错误码要落进 reason（排查靠它）');
+
+    /* ══════════ DESIGN §6：UPDATE 两段式失效（先新增，成功后才标记旧的失效） ══════════ */
+
+    /* 25. 成功路径：insertEntry 先于 supersedeEntry，by = 新条目 contentId */
+    const twoPhase = fakeStore({
+        // 主插件 `insertEntry` 回的是「带 firstSeen 的索引 id」，契约要的 `by` 是 contentId。
+        entryId: (ts, text) => `content${String(text).length}`, // 故意与下面的 inserted.id 不同
+        async insertEntry(scope, entry, options) {
+            twoPhase.calls.push({ name: 'insertEntry', args: [scope, entry, options] });
+            return { written: true, id: 'new1234567', target: 'D:\\fact' };
+        },
+        async supersedeEntry(scope, target, options) {
+            twoPhase.calls.push({ name: 'supersedeEntry', args: [scope, target, options] });
+            return { ok: true, path: 'D:\\fact', entry: { text: 'old' }, revision: 'r1' };
+        },
+    });
+    const supersededCountBefore = existsSync(supersededFile) ? readFileSync(supersededFile, 'utf8').trim().split('\n').length : 0;
+    const twoPhaseResult = await createWriter({ store: twoPhase.store, supersededFile, supersedeOnUpdate: true }).apply(
+        [OP_UPDATE],
+        { cwd: 'D:\\proj', workspaceId: 'ws-1', now: NOW + 5 },
+    );
+    assert.equal(twoPhaseResult.results[0].status, WRITE_STATUS.REPLACED, '两段式属于「已替换」语义');
+    assert.equal(twoPhaseResult.results[0].reason, 'supersede');
+    assert.equal(twoPhaseResult.counts.replaced, 1);
+    assert.equal(twoPhaseResult.counts.written, 0);
+    assert.equal(twoPhaseResult.counts.failed, 0);
+    const insertIndex = twoPhase.calls.findIndex((call) => call.name === 'insertEntry');
+    const supersedeIndex = twoPhase.calls.findIndex((call) => call.name === 'supersedeEntry');
+    assert.ok(insertIndex >= 0 && supersedeIndex > insertIndex, '必须先写新条目，再给旧条目打失效标记');
+    const supersedeCall = twoPhase.calls[supersedeIndex];
+    assert.equal(supersedeCall.args[0], 'fact', 'scope 映射成 store 的 fact');
+    assert.deepEqual(supersedeCall.args[1], { id: OP_UPDATE.target }, 'target 是旧条目 id（不猜）');
+    assert.equal(supersedeCall.args[2].by, `content${OP_UPDATE.content.length}`, 'by 必须是新条目的 contentId（不是索引 id）');
+    assert.equal(supersedeCall.args[2].at, NOW + 5, 'at 用本次写入时间');
+    assert.equal(supersedeCall.args[2].cwd, 'D:\\proj');
+    assert.ok(!twoPhase.calls.some((call) => call.name === 'replaceEntry'), '两段式成功就不该再原子替换');
+    const supersededCountAfter = readFileSync(supersededFile, 'utf8').trim().split('\n').length;
+    assert.ok(supersededCountAfter > supersededCountBefore, '旧值仍要进 superseded.jsonl（审计）');
+
+    /* 26. 新旧正文相同 ⇒ 不值得「新增 + 失效」，走原子替换 */
+    const sameText = fakeStore({
+        async supersedeEntry(scope, target, options) {
+            sameText.calls.push({ name: 'supersedeEntry', args: [scope, target, options] });
+            return { ok: true };
+        },
+    });
+    const sameResult = await createWriter({ store: sameText.store, supersededFile }).apply(
+        [{ ...OP_UPDATE, content: OP_UPDATE.superseded.text }],
+        { cwd: 'D:\\proj', now: NOW },
+    );
+    assert.equal(sameResult.results[0].status, WRITE_STATUS.REPLACED);
+    assert.ok(sameText.calls.some((call) => call.name === 'replaceEntry'), '正文没变就只替换');
+    assert.ok(!sameText.calls.some((call) => call.name === 'supersedeEntry'), '正文没变不该多写一条再失效一条');
+
+    /* 27. 新条目没写成（written:false）⇒ 回退 replaceEntry，且绝不标记旧的失效 */
+    const rejectedInsert = fakeStore({
+        async insertEntry(scope, entry, options) {
+            rejectedInsert.calls.push({ name: 'insertEntry', args: [scope, entry, options] });
+            return { written: false, reason: 'template-rejected' };
+        },
+        async supersedeEntry(scope, target, options) {
+            rejectedInsert.calls.push({ name: 'supersedeEntry', args: [scope, target, options] });
+            return { ok: true };
+        },
+    });
+    const fallbackResult = await createWriter({ store: rejectedInsert.store, supersededFile }).apply([OP_UPDATE], { cwd: 'D:\\proj' });
+    assert.equal(fallbackResult.results[0].status, WRITE_STATUS.REPLACED, '回退替换成功 ⇒ 记 replaced');
+    assert.equal(fallbackResult.counts.failed, 0);
+    assert.ok(rejectedInsert.calls.some((call) => call.name === 'replaceEntry'), '写不进新条目 ⇒ 回退原子替换');
+    assert.ok(!rejectedInsert.calls.some((call) => call.name === 'supersedeEntry'), '新条目没写进去，旧的绝不能标记失效');
+
+    /* 28. 新条目被降级写 JOURNAL（demoted:'journal'）⇒ 记 DEMOTED，不再 replace（避免重复写 JOURNAL） */
+    const journalInsert = fakeStore({
+        async insertEntry(scope, entry, options) {
+            journalInsert.calls.push({ name: 'insertEntry', args: [scope, entry, options] });
+            return { written: false, demoted: 'journal', reason: '问句（请改写成陈述句）' };
+        },
+        async supersedeEntry(scope, target, options) {
+            journalInsert.calls.push({ name: 'supersedeEntry', args: [scope, target, options] });
+            return { ok: true };
+        },
+    });
+    const journalInsertResult = await createWriter({ store: journalInsert.store, supersededFile }).apply([OP_UPDATE], { cwd: 'D:\\proj' });
+    assert.equal(journalInsertResult.results[0].status, WRITE_STATUS.DEMOTED);
+    assert.equal(journalInsertResult.counts.failed, 0);
+    assert.equal(journalInsert.calls.filter((call) => call.name === 'appendJournal').length, 1, '只写一次 JOURNAL');
+    assert.ok(!journalInsert.calls.some((call) => call.name === 'replaceEntry'), '已降级写 JOURNAL，再替换会重复写');
+    assert.ok(!journalInsert.calls.some((call) => call.name === 'supersedeEntry'), '旧条目不许标记失效');
+
+    /* 29. 第二步失败（supersede 返回 ok:false）⇒ 回退替换；刚多写的那条尽力撤掉 */
+    const supersedeRefused = fakeStore({
+        async insertEntry(scope, entry, options) {
+            supersedeRefused.calls.push({ name: 'insertEntry', args: [scope, entry, options] });
+            return { written: true, id: 'new9999999' };
+        },
+        async supersedeEntry(scope, target, options) {
+            supersedeRefused.calls.push({ name: 'supersedeEntry', args: [scope, target, options] });
+            return { ok: false, reason: 'not-found' };
+        },
+    });
+    const refusedResult = await createWriter({ store: supersedeRefused.store, supersededFile }).apply([OP_UPDATE], { cwd: 'D:\\proj' });
+    assert.equal(refusedResult.results[0].status, WRITE_STATUS.REPLACED, '回退替换成功 ⇒ 结果仍是 replaced');
+    assert.equal(refusedResult.results[0].reason, 'supersede-fallback:not-found', '回退原因要能看见');
+    assert.ok(supersedeRefused.calls.some((call) => call.name === 'replaceEntry'), '第二步失败必须回退原子替换');
+    const cleanupCall = supersedeRefused.calls.find((call) => call.name === 'deleteEntry');
+    assert.ok(cleanupCall !== undefined, '替换成功后要把多写的那条撤掉（尽力而为）');
+    assert.deepEqual(cleanupCall.args, ['fact', 'new9999999']);
+
+    /* 30. 两步都失败 ⇒ 记 FAILED，且仍不标记旧条目失效（内容已写进文件，不算丢） */
+    const bothBroken = fakeStore({
+        async insertEntry(scope, entry, options) {
+            bothBroken.calls.push({ name: 'insertEntry', args: [scope, entry, options] });
+            return { written: true, id: 'new0000000' };
+        },
+        async supersedeEntry() {
+            const error = new Error('supersede 锁超时');
+            error.code = 'MEMORY_LOCK_TIMEOUT';
+            throw error;
+        },
+        async replaceEntry() {
+            throw new Error('磁盘只读');
+        },
+    });
+    const bothBrokenResult = await createWriter({ store: bothBroken.store, supersededFile }).apply([OP_UPDATE], { cwd: 'D:\\proj' });
+    assert.equal(bothBrokenResult.results[0].status, WRITE_STATUS.FAILED);
+    assert.ok(String(bothBrokenResult.results[0].reason).startsWith('supersede-failed:MEMORY_LOCK_TIMEOUT'), bothBrokenResult.results[0].reason);
+    assert.equal(bothBrokenResult.counts.failed, 1);
+    assert.ok(!bothBroken.calls.some((call) => call.name === 'deleteEntry'), '替换都没成功，不许先撤掉新条目');
+
+    /* 31. 开关关掉（supersedeOnUpdate:false）⇒ 即便 store 支持也走原子替换 */
+    const switchOff = fakeStore({
+        async supersedeEntry(scope, target, options) {
+            switchOff.calls.push({ name: 'supersedeEntry', args: [scope, target, options] });
+            return { ok: true };
+        },
+    });
+    const switchOffResult = await createWriter({ store: switchOff.store, supersededFile, supersedeOnUpdate: false }).apply([OP_UPDATE], { cwd: 'D:\\proj' });
+    assert.equal(switchOffResult.results[0].status, WRITE_STATUS.REPLACED);
+    assert.ok(switchOff.calls.some((call) => call.name === 'replaceEntry'));
+    assert.ok(!switchOff.calls.some((call) => call.name === 'insertEntry'), '开关关掉不许走两段式');
+    assert.ok(!switchOff.calls.some((call) => call.name === 'supersedeEntry'));
+
+    /* 32. 拿不到旧正文（op.superseded 缺失）⇒ 不猜，走原子替换 */
+    const noOldText = fakeStore({
+        async supersedeEntry(scope, target, options) {
+            noOldText.calls.push({ name: 'supersedeEntry', args: [scope, target, options] });
+            return { ok: true };
+        },
+    });
+    const noOldResult = await createWriter({ store: noOldText.store, supersededFile }).apply(
+        [{ op: 'UPDATE', scope: 'global', target: 'abc1234567', content: '改写后的正文', ts: 1, layer: 1 }],
+        { cwd: 'D:\\proj' },
+    );
+    assert.equal(noOldResult.results[0].status, WRITE_STATUS.REPLACED);
+    assert.ok(noOldText.calls.some((call) => call.name === 'replaceEntry'), '无法证明新旧不同 ⇒ 保守替换');
+    assert.ok(!noOldText.calls.some((call) => call.name === 'supersedeEntry'));
+
+    /* 33. 闸口在第一步就撞限 ⇒ 降级 JOURNAL，insert / supersede / replace 一个都不试 */
+    let supersedeInsertTried = 0;
+    const limitedTwoPhase = fakeStore({
+        async assertEntry() {
+            throw budgetError();
+        },
+        async insertEntry() {
+            supersedeInsertTried += 1;
+        },
+        async supersedeEntry(scope, target, options) {
+            limitedTwoPhase.calls.push({ name: 'supersedeEntry', args: [scope, target, options] });
+            return { ok: true };
+        },
+    });
+    const limitedTwoPhaseResult = await createWriter({ store: limitedTwoPhase.store, supersededFile }).apply([OP_UPDATE], { cwd: 'D:\\proj' });
+    assert.equal(limitedTwoPhaseResult.results[0].status, WRITE_STATUS.DEMOTED);
+    assert.equal(supersedeInsertTried, 0, '闸口说满就别插');
+    assert.ok(!limitedTwoPhase.calls.some((call) => call.name === 'supersedeEntry'), '撞限时旧条目绝不能标记失效');
 } finally {
     cleanup();
 }

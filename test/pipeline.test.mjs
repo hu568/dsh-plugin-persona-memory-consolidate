@@ -14,11 +14,12 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createBudget } from '../lib/budget.js';
+import { createCallModel } from '../lib/llm.js';
 import { readCursor } from '../lib/cursor.js';
 import { archivePath, readRows, readUnconsumed } from '../lib/pending.js';
-import { latestRunId, rollbackRun, runAllBuckets, runL1, snapshotFiles } from '../lib/pipeline.js';
+import { latestRunId, rollbackRun, runAllBuckets, runL1, screenCrossPool, snapshotFiles } from '../lib/pipeline.js';
 import { readLastRun } from '../lib/runlog.js';
-import { NOW, fakeModel, makeHome, makeRuntime, memoryStore, seedRows, sha256 } from './_helpers.mjs';
+import { NOW, fakeModel, fakeStore, makeHome, makeRuntime, memoryStore, seedRows, sha256 } from './_helpers.mjs';
 
 const FACT_SEED = '## 约定\n\n- 依赖用 tarball 装，不用 pnpm install\n';
 const MEMORY_SEED = '## 结论\n\n1. 项目记忆里已有的一条结论\n';
@@ -197,28 +198,43 @@ try {
     const allDir = join(home, 'pending-all');
     seedRows({ pendingDir: allDir, bucket: 'ws-7', sessionId: 'session-g', count: 6 });
     seedRows({ pendingDir: allDir, bucket: 'ws-8', sessionId: 'session-h', count: 6 });
-    const replies = ['逐桶运行的第一条新结论', '逐桶运行的第二条新结论'];
+    /* 内容刻意拉开（相似度 < 0.45），两个桶都该走 ADD；相等的正文会被跨池闸口判成
+     * near-duplicate——那正好是「同一条结论被写两遍」的现场，不能拿它当「两桶都跑了」的证据。 */
+    const replies = ['第一桶写入：本地打包流程已核对完成', '第二桶写入：界面配色改成黛青色'];
     let replyIndex = 0;
     const perBucket = makeRuntime({
         store,
-        model: async () => JSON.stringify({ memories: [{ scope: 'global', content: replies[replyIndex] ?? replies[0] }] }),
+        /*
+         * 抽取调用按**真实调用次数**换正文。
+         *
+         * 旧写法把计数器挂在 `perBucket.callModel` 上，但抽取器在 `makeRuntime` 时
+         * 就捕获了注入的 model 函数（`createExtractor({ callModel })`），那个包装根本
+         * 不会被抽取路径调用 ⇒ 两个桶一直拿到同一句。跨池闸口上线后第二个桶会被判
+         * `near-duplicate`，于是这里必须让「每次调用换一条」真的生效。
+         */
+        model: fakeModel({
+            extraction: () => JSON.stringify({
+                memories: [{ scope: 'global', content: replies[Math.min(replyIndex++, replies.length - 1)] }],
+            }),
+        }),
         config: { dryRun: false },
         registry: { workspaces: { 'ws-7': { path: '', title: '工作区七', sessionIds: ['session-g'] } } },
     });
     perBucket.pendingDir = allDir;
-    // 每次调用换一条正文（内容是常量的话，第二个桶会因「已存在」被判 NOOP，掩盖「两个桶都真跑了」）
-    const originalCall = perBucket.callModel;
-    perBucket.callModel = async (request) => {
-        const reply = await originalCall(request);
-        replyIndex += 1;
-        return reply;
-    };
 
     const all = await runAllBuckets({ runtime: perBucket, dryRun: false, now: NOW + 60 });
     assert.equal(all.skipped, undefined);
     assert.equal(all.runs.length, 2, '两个非空桶都要跑');
     assert.deepEqual(all.runs.map((run) => run.bucket).sort(), ['ws-7', 'ws-8']);
     assert.ok(all.runs.every((run) => run.status === 'OK'));
+    assert.equal(
+        all.runs.reduce((sum, run) => sum + (run.counts?.written ?? 0), 0),
+        2,
+        '两个桶各写一条（内容不同，不该被跨池判重）',
+    );
+    assert.ok(all.runs.every((run) => (run.gate?.['near-duplicate'] ?? 0) === 0), '两条内容不同，不该有跨池拦截');
+    const bucketFactText = readFileSync(store.factPath(), 'utf8');
+    assert.ok(bucketFactText.includes(replies[0]) && bucketFactText.includes(replies[1]), '两条结论都要落盘');
     const titled = all.runs.find((run) => run.bucket === 'ws-7');
     assert.equal(titled.title, '工作区七', '桶标题来自工作区注册表');
     assert.equal(perBucket.budget.snapshot().used.total, 1, '一次运行只占一次预算（额外的裁决调用才补扣）');
@@ -283,6 +299,385 @@ try {
     const shadowLines = readFileSync(observed.wouldWrite.file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.ok(shadowLines.some((line) => line.content === '影子档里这条本来会被写进 FACT'), '影子文件要含本来会写的正文');
     assert.ok(shadowLines.every((line) => String(line.status).startsWith('would-')));
+
+    /* ── 12. 路径优先：未分组桶里的行按 cwd 找到工作区，项目记忆照写 ── */
+    const projectPath = join(home, 'proj-path');
+    mkdirSync(projectPath, { recursive: true });
+    const pathStore = memoryStore({ home, projectDir: projectPath, factText: FACT_SEED, memoryText: MEMORY_SEED });
+    const pathRuntime = makeRuntime({
+        store: pathStore,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'project', content: '项目记忆按工作目录归属', confidence: 'high' }] }) }),
+        config: { dryRun: false },
+        registry: { workspaces: { 'ws-path': { path: projectPath, title: '路径项目', sessionIds: [] } } },
+    });
+    seedRows({ bucket: '_unassigned', sessionId: 'session-path', count: 6, cwd: join(projectPath, 'sub') });
+    const byPath = await runL1({ runtime: pathRuntime, bucket: { workspaceId: '_unassigned', title: '', path: '' }, now: NOW + 120 });
+    assert.equal(byPath.status, 'OK');
+    assert.equal(byPath.projectWorkspaceId, 'ws-path', '未分组行要按路径解析出真实工作区');
+    assert.equal(byPath.counts.written, 1, 'project 条目应写进项目记忆，而不是降级 JOURNAL');
+    assert.ok(readFileSync(join(projectPath, 'MEMORY.md'), 'utf8').includes('项目记忆按工作目录归属'));
+    assert.equal(readUnconsumed({ pendingDir: pathRuntime.pendingDir, bucket: '_unassigned' }).length, 0, '桶身份仍按原桶消费（行不搬家）');
+    assert.equal(readCursor(pathRuntime.cursorFile).sessions['_unassigned:session-path'].turn, 6, '游标仍记在原桶键上');
+
+    /* ── 13. 确定性闸口：坏结论被拦下，但**计数可见**（不能静默丢） ── */
+    seedRows({ bucket: 'ws-gate', sessionId: 'session-gate', count: 6, cwd: projectDir });
+    const gateRuntime = makeRuntime({
+        store,
+        model: fakeModel({
+            extraction: JSON.stringify({
+                memories: [
+                    { scope: 'global', content: '暂无' },
+                    { scope: 'global', content: '太短' },
+                    { scope: 'global', content: '闸口放行的这条结论必须真的写进 FACT', confidence: 'high' },
+                    { scope: 'global', content: '闸口放行的这条结论必须真的写进 FACT', confidence: 'high' },
+                ],
+            }),
+        }),
+        config: { dryRun: false },
+    });
+    const gated = await runL1({ runtime: gateRuntime, bucket: { workspaceId: 'ws-gate', path: projectDir }, now: NOW + 130 });
+    assert.equal(gated.status, 'OK', `闸口放行后应成功：${gated.status} / ${gated.reason}`);
+    assert.equal(gated.candidates, 1, '4 条候选只留 1 条');
+    assert.deepEqual(
+        { total: gated.gate.total, kept: gated.gate.kept, dropped: gated.gate.dropped },
+        { total: 4, kept: 1, dropped: 3 },
+    );
+    assert.equal(gated.gate.placeholder, 1);
+    assert.equal(gated.gate['too-short'], 1);
+    assert.equal(gated.gate.duplicate, 1);
+    const gateLogged = readLastRun({ file: gateRuntime.runLog.path });
+    assert.deepEqual(
+        { total: gateLogged.gate.total, dropped: gateLogged.gate.dropped },
+        { total: 4, dropped: 3 },
+        'runlog 必须落 gate 分类计数（被过滤项不能静默消失）',
+    );
+    const gateFact = readFileSync(store.factPath(), 'utf8');
+    assert.ok(gateFact.includes('闸口放行的这条结论必须真的写进 FACT'));
+    assert.ok(!gateFact.includes('暂无'), '空壳不许写进 FACT');
+    assert.equal(readUnconsumed({ pendingDir: gateRuntime.pendingDir, bucket: 'ws-gate' }).length, 0, '有写成功就消费');
+
+    /* ── 14. 闸口全丢：状态 NOOP + reason=gate-dropped + 不消费 ── */
+    seedRows({ bucket: 'ws-gate-all', sessionId: 'session-gate-all', count: 6 });
+    const allDroppedRuntime = makeRuntime({
+        store,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: '暂无' }, { scope: 'global', content: '我先看了一下配置' }] }) }),
+        config: { dryRun: false },
+    });
+    const allDropped = await runL1({ runtime: allDroppedRuntime, bucket: 'ws-gate-all', now: NOW + 140 });
+    assert.equal(allDropped.status, 'NOOP');
+    assert.equal(allDropped.skipped, 'no-candidates');
+    assert.equal(allDropped.reason, 'gate-dropped', '丢光时 reason 要说清是闸口干的');
+    assert.equal(readLastRun({ file: allDroppedRuntime.runLog.path }).reason, 'gate-dropped');
+    assert.equal(readUnconsumed({ pendingDir: allDroppedRuntime.pendingDir, bucket: 'ws-gate-all' }).length, 6, '没写成不消费');
+
+    /* ── 15. finish.failure.code='' ⇒ runlog 必须带 :LLM_FINISHED_ABORTED 与 detail（本机故障复现） ── */
+    const emptyCodeModel = createCallModel({
+        getLlm: () => ({
+            stream() {
+                return (async function* replay() {
+                    yield { type: 'finish', reason: { kind: 'error', failure: { code: '' } } };
+                })();
+            },
+        }),
+        config: { provider: 'p', model: 'm' },
+    });
+    seedRows({ bucket: 'ws-empty-code', sessionId: 'session-empty-code', count: 6 });
+    const emptyCodeRuntime = makeRuntime({ store, model: emptyCodeModel, config: { dryRun: false } });
+    const emptyCode = await runL1({ runtime: emptyCodeRuntime, bucket: 'ws-empty-code', now: NOW + 150 });
+    assert.equal(emptyCode.status, 'FAIL');
+    assert.equal(emptyCode.skipped, 'extract-failed');
+    const emptyCodeLogged = readLastRun({ file: emptyCodeRuntime.runLog.path });
+    assert.equal(
+        emptyCodeLogged.reason,
+        'extract-model-error:LLM_FINISHED_ABORTED',
+        '空 code 不许吞成裸 extract-model-error（本机 35/35 的现场）',
+    );
+    assert.ok(typeof emptyCodeLogged.detail === 'string' && emptyCodeLogged.detail.length > 0, 'detail 必须非空');
+    assert.ok(emptyCodeLogged.detail.includes("failure.code=''"), `detail 要原样带 finish 形状：${emptyCodeLogged.detail}`);
+    assert.ok(emptyCodeLogged.detail.includes('模型调用未正常结束'), 'detail 要含真实错误消息');
+    assert.equal(Number.isFinite(emptyCodeLogged.durationMs), true, 'FAIL 记录要带真实耗时 durationMs');
+    assert.ok(emptyCodeLogged.durationMs >= 0);
+    assert.equal(readUnconsumed({ pendingDir: emptyCodeRuntime.pendingDir, bucket: 'ws-empty-code' }).length, 6, '失败不消费');
+
+    /* ── 16. store 判 demoted:'journal' ⇒ 写 JOURNAL 且**行被消费**（P0-2） ── */
+    const demoteStore = fakeStore({
+        async insertEntry(scope, entry) {
+            demoteStore.calls.push({ name: 'insertEntry', args: [scope, entry] });
+            return { written: false, demoted: 'journal', reason: '问句（请改写成陈述句）' };
+        },
+    });
+    const stringDemoteRuntime = makeRuntime({
+        store: demoteStore.store,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: '这条会被 store 判成降级', confidence: 'high' }] }) }),
+        config: { dryRun: false },
+    });
+    seedRows({ bucket: 'ws-demote-string', sessionId: 'session-demote-string', count: 6 });
+    const stringDemoted = await runL1({ runtime: stringDemoteRuntime, bucket: 'ws-demote-string', now: NOW + 160 });
+    assert.equal(stringDemoted.counts.demoted, 1, '字符串 journal 也是降级');
+    assert.equal(stringDemoted.counts.failed, 0);
+    assert.equal(stringDemoted.counts.written, 0);
+    assert.ok(demoteStore.calls.some((call) => call.name === 'appendJournal'), '要真的写一次 JOURNAL');
+    assert.equal(readUnconsumed({ pendingDir: stringDemoteRuntime.pendingDir, bucket: 'ws-demote-string' }).length, 0, '降级属于写成，行要消费掉');
+    /* ── 17. gateEnabled=false：整批放行，且 runlog **不写** gate 字段（一键关闸口） ── */
+    seedRows({ bucket: 'ws-gate-off', sessionId: 'session-gate-off', count: 6 });
+    const gateOffRuntime = makeRuntime({
+        store,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: '闸口短句', confidence: 'high' }] }) }),
+        config: { dryRun: false, gateEnabled: false },
+    });
+    const gateOff = await runL1({ runtime: gateOffRuntime, bucket: { workspaceId: 'ws-gate-off', path: projectDir }, now: NOW + 170 });
+    assert.equal(gateOff.status, 'OK', `关闭闸口后应成功：${gateOff.status} / ${gateOff.reason}`);
+    assert.equal(gateOff.candidates, 1, '太短的结论在关闭闸口后照常进管线');
+    assert.equal(gateOff.counts.written, 1, '闸口关了就真的写进去（误杀一键回滚）');
+    assert.equal(gateOff.gate, undefined, '关闭时返回值里没有 gate 计数');
+    assert.ok(readFileSync(store.factPath(), 'utf8').includes('闸口短句'), '太短的结论要落进 FACT');
+    const gateOffLogged = readLastRun({ file: gateOffRuntime.runLog.path });
+    assert.equal(gateOffLogged.status, 'OK');
+    assert.equal(
+        Object.prototype.hasOwnProperty.call(gateOffLogged, 'gate'),
+        false,
+        '关闭时 runlog 不写 gate（「没启用」与「启用了没拦」是两件事）',
+    );
+    assert.equal(readUnconsumed({ pendingDir: gateOffRuntime.pendingDir, bucket: 'ws-gate-off' }).length, 0, '写成功就消费');
+    /* ── 18. failure.code='UNKNOWN' + 真实 message ⇒ reason 带 :UNKNOWN，detail 带 401 原文 ── */
+    const unknownCodeModel = createCallModel({
+        getLlm: () => ({
+            stream() {
+                return (async function* replay() {
+                    yield { type: 'finish', reason: { kind: 'error', failure: { code: 'UNKNOWN', message: '401 invalid api key' } } };
+                })();
+            },
+        }),
+        config: { provider: 'p', model: 'm' },
+    });
+    seedRows({ bucket: 'ws-unknown-code', sessionId: 'session-unknown-code', count: 6 });
+    const unknownCodeRuntime = makeRuntime({ store, model: unknownCodeModel, config: { dryRun: false } });
+    const unknownCode = await runL1({ runtime: unknownCodeRuntime, bucket: 'ws-unknown-code', now: NOW + 180 });
+    assert.equal(unknownCode.status, 'FAIL');
+    const unknownLogged = readLastRun({ file: unknownCodeRuntime.runLog.path });
+    assert.equal(unknownLogged.reason, 'extract-model-error:UNKNOWN', '宿主归一后的 UNKNOWN 要落进 reason');
+    assert.ok(String(unknownLogged.detail).includes('401 invalid api key'), `detail 要含真实 HTTP 消息：${unknownLogged.detail}`);
+    assert.ok(String(unknownLogged.detail).includes("failure.code='UNKNOWN'"), unknownLogged.detail);
+    assert.equal(Number.isFinite(unknownLogged.durationMs), true, 'UNKNOWN 失败也要带耗时');
+
+    /* ══════════ DESIGN §5：跨池近重复闸口（归并前拦 NOOP，ADJUDICATE 放行） ══════════ */
+
+    /* 19. 三条候选：exact 重复被拦（计入 gate）；0.75 的 ADJUDICATE 放行并裁决为 UPDATE；全新条目 ADD */
+    const crossDir = join(home, 'proj-cross');
+    mkdirSync(crossDir, { recursive: true });
+    const CROSS_OLD = '依赖用 tarball 装，不用 pnpm install';
+    const crossStore = memoryStore({ home, projectDir: crossDir, factText: `## 约定\n\n- ${CROSS_OLD}\n` });
+    const crossRuntime = makeRuntime({
+        store: crossStore,
+        model: fakeModel({
+            extraction: JSON.stringify({
+                memories: [
+                    // ① 与 FACT 完全相同 ⇒ 跨池拦掉（旧行为：归并里也会 NOOP，但报告看不见）
+                    { scope: 'global', content: CROSS_OLD, confidence: 'high' },
+                    // ② 相似度约 0.75 ⇒ ADJUDICATE，必须放行（宁可漏杀不可误杀）
+                    { scope: 'global', content: '依赖用 tarball 装，不要用 pnpm install', confidence: 'high' },
+                    // ③ 全新结论 ⇒ ADD
+                    { scope: 'global', content: '跨池闸口放行的全新结论应该写进 FACT', confidence: 'high' },
+                ],
+            }),
+            adjudication: adjudicate,
+        }),
+        config: { dryRun: false },
+    });
+    seedRows({ bucket: 'ws-cross', sessionId: 'session-cross', count: 6, cwd: crossDir });
+    const crossed = await runL1({
+        runtime: crossRuntime,
+        bucket: { workspaceId: 'ws-cross', path: crossDir },
+        now: NOW + 190,
+    });
+
+    assert.equal(crossed.status, 'OK', `跨池闸口后应成功：${crossed.status} / ${crossed.reason}`);
+    assert.equal(crossed.candidates, 2, '3 条候选按跨池拦住 1 条，其余 2 条进归并');
+    assert.equal(crossed.calls, 2, '抽取 1 次 + ADJUDICATE 裁决 1 次（被拦的那条不该再花钱）');
+    assert.deepEqual(
+        { total: crossed.gate.total, kept: crossed.gate.kept, dropped: crossed.gate.dropped },
+        { total: 3, kept: 2, dropped: 1 },
+        'gate 计数要平：kept + dropped = total',
+    );
+    assert.equal(crossed.gate['near-duplicate'], 1, '跨池拦截计入新原因 near-duplicate');
+    assert.equal(crossed.counts.written, 1, '全新结论 1 条 ADD');
+    assert.equal(crossed.counts.replaced, 1, 'ADJUDICATE 那条裁决为 UPDATE');
+    const crossLogged = readLastRun({ file: crossRuntime.runLog.path });
+    assert.equal(crossLogged.gate['near-duplicate'], 1, 'runlog 必须能看见跨池拦了多少（不能静默）');
+    const crossFactText = readFileSync(crossStore.factPath(), 'utf8');
+    assert.ok(crossFactText.includes('跨池闸口放行的全新结论应该写进 FACT'));
+    assert.ok(crossFactText.includes('依赖用 tarball 装，不要用 pnpm install'), 'ADJUDICATE 的改写结果要落盘');
+    assert.ok(!crossFactText.includes(CROSS_OLD), '被裁决为 UPDATE 的旧正文应被替换');
+    assert.equal(crossFactText.split(CROSS_OLD).length - 1, 0, 'exact 重复不许再写一份');
+    assert.equal(readUnconsumed({ pendingDir: crossRuntime.pendingDir, bucket: 'ws-cross' }).length, 0, '有写成功就消费');
+
+    /* 20. `crossPoolDedup:false` ⇒ 跨池不拦；归并层照旧判 NOOP（同批/池内判定保留） */
+    const offDir = join(home, 'proj-cross-off');
+    mkdirSync(offDir, { recursive: true });
+    const offStore = memoryStore({ home, projectDir: offDir, factText: `## 约定\n\n- ${CROSS_OLD}\n` });
+    const offRuntime = makeRuntime({
+        store: offStore,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: CROSS_OLD, confidence: 'high' }] }) }),
+        config: { dryRun: false, crossPoolDedup: false },
+    });
+    seedRows({ bucket: 'ws-cross-off', sessionId: 'session-cross-off', count: 6, cwd: offDir });
+    const offSha = sha256(offStore.factPath());
+    const offResult = await runL1({ runtime: offRuntime, bucket: { workspaceId: 'ws-cross-off', path: offDir }, now: NOW + 200 });
+    assert.equal(offResult.candidates, 1, '开关关掉后候选不被跨池拦（照常进归并）');
+    assert.equal(offResult.gate['near-duplicate'], 0, '关掉后 near-duplicate 恒 0');
+    assert.equal(offResult.counts.written, 0);
+    assert.equal(offResult.counts.noop, 1, '归并层仍然把它判成 NOOP（池内判定没被一起关掉）');
+    assert.equal(sha256(offStore.factPath()), offSha, '没有真的写重复条目');
+
+    /* 20b. `gateEnabled:false` ⇒ 整层确定性过滤关掉，跨池也不跑（一键整批放行） */
+    const gateOffCrossStore = memoryStore({ home, projectDir: offDir, factText: `## 约定\n\n- ${CROSS_OLD}\n` });
+    const gateOffCrossRuntime = makeRuntime({
+        store: gateOffCrossStore,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: CROSS_OLD, confidence: 'high' }] }) }),
+        config: { dryRun: false, gateEnabled: false },
+    });
+    seedRows({ bucket: 'ws-cross-gateoff', sessionId: 'session-cross-gateoff', count: 6, cwd: offDir });
+    const gateOffCross = await runL1({ runtime: gateOffCrossRuntime, bucket: { workspaceId: 'ws-cross-gateoff', path: offDir }, now: NOW + 205 });
+    assert.equal(gateOffCross.candidates, 1, '闸口关掉时跨池也停（否则「整批放行」名不副实）');
+    assert.equal(gateOffCross.gate, undefined, '关闭时 runlog / 返回值都没有 gate 计数');
+
+    /* 21. 池为空（FACT 与项目记忆都没有条目）⇒ 放行，一个候选都不许丢 */
+    const emptyDir = join(home, 'proj-empty-pool');
+    mkdirSync(emptyDir, { recursive: true });
+    const emptyPoolStore = memoryStore({ home, projectDir: emptyDir, factText: '' });
+    const emptyPoolRuntime = makeRuntime({
+        store: emptyPoolStore,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: '池为空时闸口必须放行这条结论', confidence: 'high' }] }) }),
+        config: { dryRun: false },
+    });
+    seedRows({ bucket: 'ws-empty-pool', sessionId: 'session-empty-pool', count: 6, cwd: emptyDir });
+    const emptyPool = await runL1({ runtime: emptyPoolRuntime, bucket: { workspaceId: 'ws-empty-pool', path: emptyDir }, now: NOW + 210 });
+    assert.equal(emptyPool.status, 'OK');
+    assert.equal(emptyPool.candidates, 1);
+    assert.equal(emptyPool.gate['near-duplicate'], 0);
+    assert.equal(emptyPool.counts.written, 1);
+    assert.ok(readFileSync(emptyPoolStore.factPath(), 'utf8').includes('池为空时闸口必须放行这条结论'));
+
+    /* 21b. 池构建异常（store.entryId 抛错）⇒ 空池放行、写入照常，降级原因进 runlog.detail */
+    const poolErrDir = join(home, 'proj-pool-error');
+    mkdirSync(poolErrDir, { recursive: true });
+    const poolErrStore = memoryStore({ home, projectDir: poolErrDir, factText: `## 约定\n\n- ${CROSS_OLD}\n` });
+    poolErrStore.entryId = () => {
+        const error = new Error('池构建挂了');
+        error.code = 'POOL_BOOT_FAILED';
+        throw error;
+    };
+    const poolErrRuntime = makeRuntime({
+        store: poolErrStore,
+        model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: '池构建失败时这条结论也必须写进去', confidence: 'high' }] }) }),
+        config: { dryRun: false },
+    });
+    seedRows({ bucket: 'ws-pool-error', sessionId: 'session-pool-error', count: 6, cwd: poolErrDir });
+    const poolErrRun = await runL1({ runtime: poolErrRuntime, bucket: { workspaceId: 'ws-pool-error', path: poolErrDir }, now: NOW + 215 });
+    assert.equal(poolErrRun.status, 'OK', '池构建异常不能阻断写入');
+    assert.equal(poolErrRun.counts.written, 1);
+    assert.equal(poolErrRun.gate['near-duplicate'], 0, '空池 ⇒ 一个都不拦');
+    assert.ok(readFileSync(poolErrStore.factPath(), 'utf8').includes('池构建失败时这条结论也必须写进去'));
+    const poolErrLogged = readLastRun({ file: poolErrRuntime.runLog.path });
+    assert.ok(String(poolErrLogged.detail).includes('gate:POOL_BOOT_FAILED'), `降级原因要留痕：${poolErrLogged.detail}`);
+
+    /* 22. `screenCrossPool()` 纯函数：拦截 / 放行 / 空池 / 关闭 / 打分异常降级 */
+    const unitPool = [{ id: 'a', text: CROSS_OLD }];
+    const intercepted = screenCrossPool([{ content: CROSS_OLD }], unitPool);
+    assert.equal(intercepted.kept.length, 0, 'exact 重复要拦');
+    assert.equal(intercepted.dropped[0].reason, 'near-duplicate', '原因用稳定的 near-duplicate');
+    assert.equal(intercepted.dropped[0].preReason, 'exact');
+    assert.equal(intercepted.checked, 1);
+
+    const released = screenCrossPool([{ content: '依赖用 tarball 装，不要用 pnpm install' }], unitPool);
+    assert.equal(released.kept.length, 1, 'ADJUDICATE（0.75）必须放行');
+    assert.equal(released.dropped.length, 0);
+
+    assert.equal(screenCrossPool([{ content: CROSS_OLD }], []).kept.length, 1, '池为空 ⇒ 放行');
+    assert.equal(screenCrossPool([{ content: CROSS_OLD }], unitPool, { enabled: false }).kept.length, 1, '开关关 ⇒ 放行');
+
+    /* 打分异常（池条目 text 取值就抛）⇒ 放行 + 返回错误码，绝不阻断写入 */
+    const doomedPool = [
+        { id: 'x', get text() { throw new Error('boom'); } },
+        { id: 'y', text: '另一条正常条目' },
+    ];
+    const degraded = screenCrossPool([{ content: CROSS_OLD }, { content: '第二条候选' }], doomedPool);
+    assert.equal(degraded.kept.length, 2, '打分异常必须整批放行');
+    assert.equal(degraded.dropped.length, 0);
+    assert.equal(degraded.error?.code, 'cross-pool-error', '异常要带错误码（调用方写进 runlog.detail）');
+    assert.equal(degraded.error?.index, 0);
+
+    /* ══════════ DESIGN §6：UPDATE 走两段式失效（先新增，成功后才标记旧的） ══════════ */
+
+    /* 23. 成功路径：insertEntry 先于 supersedeEntry；旧条目只加注释、字节只增不减 */
+    const supDir = join(home, 'proj-supersede');
+    mkdirSync(supDir, { recursive: true });
+    const supFactBefore = `## 约定\n\n- ${CROSS_OLD}\n`;
+    const supStore = memoryStore({ home, projectDir: supDir, factText: supFactBefore, supersede: true });
+    const supRuntime = makeRuntime({
+        store: supStore,
+        model: fakeModel({
+            extraction: JSON.stringify({ memories: [{ scope: 'global', content: '依赖用 tarball 装，不要用 pnpm install', confidence: 'high' }] }),
+            adjudication: adjudicate,
+        }),
+        config: { dryRun: false },
+    });
+    seedRows({ bucket: 'ws-supersede', sessionId: 'session-supersede', count: 6, cwd: supDir });
+    const supRun = await runL1({ runtime: supRuntime, bucket: { workspaceId: 'ws-supersede', path: supDir }, now: NOW + 220 });
+
+    assert.equal(supRun.status, 'OK', `两段式后应成功：${supRun.status} / ${supRun.reason}`);
+    assert.equal(supRun.counts.replaced, 1, '两段式仍记 replaced（语义是「被取代」）');
+    assert.equal(supRun.counts.written, 0, '没有独立的新增条目');
+    assert.equal(supRun.counts.failed, 0);
+    const insertCall = supStore.calls.find((call) => call.name === 'insertEntry');
+    const supersedeCall = supStore.calls.find((call) => call.name === 'supersedeEntry');
+    assert.ok(insertCall !== undefined, '第一步必须写新正文');
+    assert.ok(supersedeCall !== undefined, '第二步必须标记旧条目失效');
+    assert.ok(
+        supStore.calls.indexOf(insertCall) < supStore.calls.indexOf(supersedeCall),
+        '顺序必须是「先写新的，再标记旧的」（反过来就是不可恢复的数据丢失）',
+    );
+    assert.equal(supersedeCall.args[0], 'fact');
+    assert.deepEqual(supersedeCall.args[1], { id: supStore.entryId('', CROSS_OLD) }, 'target 是旧条目 id');
+    assert.ok(/^[0-9a-f]{10}$/u.test(String(supersedeCall.args[2]?.by)), `by 必须是新条目 contentId：${supersedeCall.args[2]?.by}`);
+
+    const supFactAfter = readFileSync(supStore.factPath(), 'utf8');
+    assert.ok(supFactAfter.includes('依赖用 tarball 装，不要用 pnpm install'), '新正文要落盘');
+    assert.ok(
+        supFactAfter.includes(`${CROSS_OLD} <!-- memory-state: status=superseded by=`),
+        `旧条目只加行尾状态注释（失效不删除）：${supFactAfter}`,
+    );
+    assert.ok(
+        Buffer.byteLength(supFactAfter, 'utf8') > Buffer.byteLength(supFactBefore, 'utf8'),
+        '失效标记只会加字节，绝不删行',
+    );
+
+    /* 24. 新条目没写成 ⇒ 回退替换，且绝不标记旧条目失效（旧条目保持可用） */
+    const fallbackDir = join(home, 'proj-supersede-fallback');
+    mkdirSync(fallbackDir, { recursive: true });
+    const fbStore = memoryStore({ home, projectDir: fallbackDir, factText: `## 约定\n\n- ${CROSS_OLD}\n`, supersede: true });
+    fbStore.insertEntry = async (scope, entry, context) => {
+        fbStore.calls.push({ name: 'insertEntry', args: [scope, entry, context] });
+        return { written: false, reason: 'template-rejected' };
+    };
+    const fbRuntime = makeRuntime({
+        store: fbStore,
+        model: fakeModel({
+            extraction: JSON.stringify({ memories: [{ scope: 'global', content: '依赖用 tarball 装，不要用 pnpm install', confidence: 'high' }] }),
+            adjudication: adjudicate,
+        }),
+        config: { dryRun: false },
+    });
+    seedRows({ bucket: 'ws-supersede-fb', sessionId: 'session-supersede-fb', count: 6, cwd: fallbackDir });
+    const fbRun = await runL1({ runtime: fbRuntime, bucket: { workspaceId: 'ws-supersede-fb', path: fallbackDir }, now: NOW + 230 });
+    assert.equal(fbRun.status, 'OK');
+    assert.equal(fbRun.counts.replaced, 1, '回退原子替换成功');
+    assert.equal(fbRun.counts.failed, 0);
+    assert.ok(fbStore.calls.some((call) => call.name === 'replaceEntry'), '写不进新条目 ⇒ 回退 replaceEntry');
+    assert.ok(!fbStore.calls.some((call) => call.name === 'supersedeEntry'), '写不进新条目时绝不许标记旧的失效');
+    const fbFact = readFileSync(fbStore.factPath(), 'utf8');
+    assert.ok(fbFact.includes('依赖用 tarball 装，不要用 pnpm install'), '回退后新正文要落盘');
+    assert.ok(!fbFact.includes(`${CROSS_OLD} <!-- memory-state`), '没写成新条目就不许出现失效标记');
 } finally {
     cleanup();
 }

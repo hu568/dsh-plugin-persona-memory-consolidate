@@ -68,6 +68,9 @@ const EXPECTED = {
     // P1 运行档位：默认 auto ⇒ 没改过设置的人行为与改造前完全一致
     mode: 'auto',
     dryRun: false,
+    gateEnabled: true,
+    crossPoolDedup: true,
+    supersedeOnUpdate: true,
     scope: 'both',
     minTurns: 6,
     minChars: 8000,
@@ -81,6 +84,8 @@ const EXPECTED = {
     idleScanMinutes: 30,
     dailyLlmBudget: 60,
     maxTurnsPerCall: 6,
+    maxOutputTokens: 8192,
+    callTimeoutMs: 120000,
     partialKeep: false,
     provider: '',
     model: '',

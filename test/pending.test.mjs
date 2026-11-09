@@ -17,13 +17,16 @@ import {
     appendRow,
     archivePath,
     bucketDir,
+    bucketsForSession,
     cleanup,
+    findBucketSplits,
     listBuckets,
     listSessions,
     markConsumed,
     monthKey,
     readRows,
     readUnconsumed,
+    resolveBucket,
     sessionFile,
     summarize,
 } from '../lib/pending.js';
@@ -206,6 +209,63 @@ try {
     assert.deepEqual(listSessions(join(home, 'nope'), 'ws-x'), []);
     assert.deepEqual(cleanup({ pendingDir: join(home, 'nope'), maxAgeDays: 30, now: NOW }), { dropped: 0, files: 0 });
     assert.deepEqual(markConsumed({ pendingDir: join(home, 'nope'), bucket: 'ws-x', turns: [1] }), { marked: 0, archived: 0, files: 0 });
+
+    /* ── 会话唯一桶（P1-5）：同一会话绝不分裂到第二个桶 ── */
+    const stickyDir = join(home, 'pending-sticky');
+    const firstWrite = appendRow({
+        pendingDir: stickyDir,
+        bucket: 'a842ae62-aaa',
+        sessionId: 'session-split',
+        now: NOW,
+        row: { turn: 1, endedAt: NOW, chars: 10, consumed: false },
+    });
+    assert.equal(firstWrite.bucket, 'a842ae62-aaa');
+    assert.equal(firstWrite.relocated, false, '新会话按请求的桶写');
+
+    // cwd 变了 ⇒ 现算归属变成 _unassigned（真实故障现场），但会话必须留在旧桶
+    const secondWrite = appendRow({
+        pendingDir: stickyDir,
+        bucket: '_unassigned',
+        sessionId: 'session-split',
+        now: NOW + 1,
+        row: { turn: 2, endedAt: NOW + 1, chars: 10, consumed: false },
+    });
+    assert.equal(secondWrite.bucket, 'a842ae62-aaa', '命中旧桶就沿用（会话唯一桶）');
+    assert.equal(secondWrite.relocated, true, '要告诉调用方「本次被重定向」，不能静默');
+    assert.equal(secondWrite.requestedBucket, '_unassigned');
+    assert.deepEqual(readRows({ pendingDir: stickyDir, bucket: 'a842ae62-aaa' }).map((item) => item.row.turn), [1, 2]);
+    assert.deepEqual(readRows({ pendingDir: stickyDir, bucket: '_unassigned' }), [], '绝不在第二个桶留下文件');
+    assert.deepEqual(bucketsForSession(stickyDir, 'session-split').map((item) => item.bucket), ['a842ae62-aaa']);
+    assert.equal(bucketsForSession(stickyDir, 'session-split')[0].unconsumed, 2);
+
+    // sticky:false 才允许硬写（迁移/测试用）
+    const forced = appendRow({
+        pendingDir: stickyDir,
+        bucket: '_unassigned',
+        sessionId: 'session-split',
+        now: NOW + 2,
+        sticky: false,
+        row: { turn: 3, endedAt: NOW + 2, chars: 10, consumed: false },
+    });
+    assert.equal(forced.bucket, '_unassigned');
+    assert.equal(forced.relocated, false);
+    // 现在真的分裂了 ⇒ status 的告警行能看见
+    assert.deepEqual(findBucketSplits(stickyDir), [{ session: 'session-split', buckets: ['_unassigned', 'a842ae62-aaa'] }]);
+    assert.deepEqual(findBucketSplits(dir), [], '没有分裂时是空数组（status 不输出告警行）');
+
+    // 多个旧桶同时存在时：优先「未消费行最多」的那个（确定性，不依赖目录顺序）
+    const pickDir = join(home, 'pending-pick');
+    appendRow({ pendingDir: pickDir, bucket: 'ws-less', sessionId: 'session-pick', sticky: false, now: NOW, row: { turn: 1, consumed: true } });
+    appendRow({ pendingDir: pickDir, bucket: 'ws-more', sessionId: 'session-pick', sticky: false, now: NOW, row: { turn: 2, consumed: false } });
+    appendRow({ pendingDir: pickDir, bucket: 'ws-more', sessionId: 'session-pick', sticky: false, now: NOW, row: { turn: 3, consumed: false } });
+    assert.deepEqual(
+        resolveBucket(pickDir, 'ws-new', 'session-pick'),
+        { bucket: 'ws-more', requested: 'ws-new', adopted: true, buckets: ['ws-less', 'ws-more'] },
+    );
+    // 请求的桶里已经有它就原样返回
+    assert.deepEqual(resolveBucket(pickDir, 'ws-less', 'session-pick'), { bucket: 'ws-less', requested: 'ws-less', adopted: false, buckets: ['ws-less', 'ws-more'] });
+    // 全新会话：不重定向
+    assert.deepEqual(resolveBucket(pickDir, 'ws-new', 'session-brand-new'), { bucket: 'ws-new', requested: 'ws-new', adopted: false, buckets: [] });
 
     /* 归档目录不被当成工作区桶（第二层逐桶迭代会跳过它） */
     assert.equal(listBuckets(dir).includes('archive'), false);
