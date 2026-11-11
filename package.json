@@ -44,7 +44,7 @@
     "node": ">=22"
   },
   "peerDependencies": {
-    "@dsh-external/dsh-persona-memory": ">=0.7.0 <0.12.0",
+    "@dsh-external/dsh-persona-memory": ">=0.7.0 <0.13.0",
     "cordis": ">=4.0.0-rc <5"
   },
   "dependencies": {
