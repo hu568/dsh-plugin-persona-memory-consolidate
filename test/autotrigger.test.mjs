@@ -646,6 +646,145 @@ try {
         ['disabled', 'duplicate', 'interrupted', 'no-content', 'no-events', 'no-session', 'no-turn', 'subagent'],
         '丢弃原因是稳定字符串表（日志/排查按它 grep）',
     );
+    /* ── 15. L2（跨会话）跟随调度（C3）：L1 成功与兜底扫描都能触发，失败不干扰 L1 ── */
+
+    /* 15a. 没接线（crossAuto 未开）⇒ 一句话不问、一次不排，行为与 0.6.0 完全一致 */
+    const noCrossRuntime = freshRuntime('cross-off');
+    const noCrossTrigger = createAutoTrigger({ runtime: noCrossRuntime, now: NOW, runConsume: recordingRunner([]) });
+    assert.deepEqual(noCrossTrigger.crossDue(NOW), { run: false, reason: 'not-wired' }, '没接线时明确回答 not-wired');
+    assert.equal(noCrossTrigger.scheduleCross(NOW), false, '没接线 ⇒ 不排 L2');
+
+    /* 15b. 注入执行体：首次（游标 0）到期，微任务里真的跑一次 */
+    const crossRuntime = freshRuntime('cross-due');
+    const crossRuns = [];
+    const crossTrigger = createAutoTrigger({
+        runtime: crossRuntime,
+        now: NOW,
+        runConsume: recordingRunner([]),
+        runCross: async (now) => {
+            crossRuns.push(now);
+            return { status: 'OK' };
+        },
+    });
+    assert.equal(crossTrigger.scheduleCross(NOW), true, 'first-run（游标 0）应当到期');
+    await flush();
+    assert.equal(crossRuns.length, 1, 'L2 执行体要被真的调用一次');
+    assert.equal(crossTrigger.stats.cross, 1, 'stats.cross 记录 L2 次数');
+
+    /* 15c. 单飞：上一次还没跑完时不许再排（真实调用在跑的时候） */
+    let releaseCross = () => {};
+    const busyTrigger = createAutoTrigger({
+        runtime: freshRuntime('cross-busy'),
+        now: NOW,
+        runCross: () => new Promise((resolve) => {
+            releaseCross = resolve;
+        }),
+    });
+    assert.equal(busyTrigger.scheduleCross(NOW), true);
+    await flush();
+    assert.equal(busyTrigger.scheduleCross(NOW), false, '执行中不许叠跑（单飞）');
+    releaseCross({ status: 'OK' });
+    await flush();
+
+    /* 15d. L1 消费成功之后顺手问一次 L2（跟着 L1 的调度） */
+    const afterL1Runtime = freshRuntime('cross-after-l1', { minTurns: 1, minChars: 100 });
+    const afterL1Runs = [];
+    const afterL1Cross = [];
+    const afterL1Trigger = createAutoTrigger({
+        runtime: afterL1Runtime,
+        now: NOW,
+        runConsume: recordingRunner(afterL1Runs),
+        runCross: async (now) => {
+            afterL1Cross.push(now);
+            return { status: 'OK' };
+        },
+    });
+    afterL1Trigger.onSessionEvent(
+        sessionOf(SESSION_MAIN, makeTurn({ turn: 1, user: 'L2 也跟着跑', assistant: [LONG_ASSISTANT] }, { seq: 0 })),
+        turnEnd(1),
+    );
+    await flush();
+    assert.equal(afterL1Runs.length, 1, 'L1 照常消费');
+    assert.equal(afterL1Cross.length, 1, 'L1 成功后 L2 也被问了一次并触发');
+
+    /* 15e. 预算不足 ⇒ runlog 里看到 layer2 SKIPPED（不是 FAIL） */
+    const budgetCrossRuntime = freshRuntime('cross-budget');
+    budgetCrossRuntime.budget = {
+        tryStart: () => ({ ok: false, reason: 'budget' }),
+        settle() {},
+        canStart: () => ({ ok: true }),
+    };
+    const budgetCrossTrigger = createAutoTrigger({ runtime: budgetCrossRuntime, now: NOW, crossAuto: true });
+    assert.equal(budgetCrossTrigger.scheduleCross(NOW), true, '预算判定前置是 canStart，到点仍要排');
+    await flush();
+    const crossLogs = readFileSync(budgetCrossRuntime.runLog.path, 'utf8').trim().split('\n')
+        .map((line) => JSON.parse(line))
+        .filter((record) => record.phase === 'layer2');
+    // runlog 是同一个临时 DSH_HOME 下的共享文件，按 reason 精确筛「本次这条」。
+    const budgetLogs = crossLogs.filter((record) => record.reason === 'budget');
+    assert.equal(budgetLogs.length, 1, 'runlog 必须能观察到 layer2 记录（可观测）');
+    assert.equal(budgetLogs[0].status, 'SKIPPED', '预算不足 ⇒ SKIPPED 而不是 FAIL');
+
+    /* 15f. 没有模型 ⇒ SKIPPED（不阻塞、也不是故障） */
+    const noModelRuntime = freshRuntime('cross-nomodel');
+    noModelRuntime.extractor = null;
+    const noModelTrigger = createAutoTrigger({ runtime: noModelRuntime, now: NOW, crossAuto: true });
+    assert.equal(noModelTrigger.scheduleCross(NOW), true);
+    await flush();
+    const noModelLogs = readFileSync(noModelRuntime.runLog.path, 'utf8').trim().split('\n')
+        .map((line) => JSON.parse(line))
+        .filter((record) => record.phase === 'layer2');
+    const noModelSkipped = noModelLogs.filter((record) => record.reason === 'model-not-wired');
+    assert.equal(noModelSkipped.length, 1);
+    assert.equal(noModelSkipped[0].status, 'SKIPPED', '没有模型是「这次不整理」，不是失败');
+
+    /* 15g. L2 抛错也不穿透事件总线、不动暂存行、L1 的消费判定不受影响 */
+    const crossErrCtx = fakeCtx();
+    const crossErrRuntime = freshRuntime('cross-error');
+    const crossErrTrigger = createAutoTrigger({
+        runtime: crossErrRuntime,
+        ctx: crossErrCtx,
+        now: NOW,
+        runCross: async () => {
+            throw new Error('跨会话上游 502');
+        },
+    });
+    assert.equal(crossErrTrigger.scheduleCross(NOW), true);
+    await flush();
+    assert.ok(crossErrCtx.warns.some((line) => line.includes('跨会话整理失败')), '失败要留 warn');
+    const crossErrLogs = readFileSync(crossErrRuntime.runLog.path, 'utf8').trim().split('\n')
+        .map((line) => JSON.parse(line))
+        .filter((record) => record.phase === 'layer2');
+    const crossErrFail = crossErrLogs.filter((record) => String(record.reason ?? '').startsWith('auto-cross-'));
+    assert.equal(crossErrFail.length, 1, 'L2 异常也要落 layer2 runlog（不许静默）');
+    assert.equal(crossErrFail[0].status, 'FAIL');
+    assert.equal(crossErrRuntime.budget.snapshot(NOW).failures, 0, 'L2 失败绝不喂 L1 的退避计数');
+
+    /* 15h. crossEnabled=false ⇒ 即使接线了也不排 */
+    const crossDisabledRuntime = freshRuntime('cross-disabled', { crossEnabled: false });
+    const crossDisabledTrigger = createAutoTrigger({
+        runtime: crossDisabledRuntime,
+        now: NOW,
+        runCross: async () => ({ status: 'OK' }),
+    });
+    assert.deepEqual(crossDisabledTrigger.crossDue(NOW), { run: false, reason: 'disabled' }, '关掉跨会话 ⇒ disabled');
+    assert.equal(crossDisabledTrigger.scheduleCross(NOW), false);
+
+    /* 15i. 兜底扫描也能触发 L2（安静日子没有 L1 消费时的唯一触发点） */
+    const scanCrossRuntime = freshRuntime('cross-scan');
+    const scanCrossRuns = [];
+    const scanCrossTrigger = createAutoTrigger({
+        runtime: scanCrossRuntime,
+        now: NOW,
+        runConsume: recordingRunner([]),
+        runCross: async (now) => {
+            scanCrossRuns.push(now);
+            return { status: 'OK' };
+        },
+    });
+    scanCrossTrigger.scan();
+    await flush();
+    assert.equal(scanCrossRuns.length, 1, 'scan() 到点也排 L2');
 } finally {
     cleanup();
 }
