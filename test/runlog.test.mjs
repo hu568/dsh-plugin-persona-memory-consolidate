@@ -80,7 +80,7 @@ try {
 
     /* ── DESIGN §14.2：`layers` 结构化分层计数（只留数字，未知键不漏进去） ── */
     assert.ok(RECORD_FIELDS.includes('layers'), 'layers 必须在记录白名单里（否则写了也会被丢掉）');
-    assert.deepEqual(LAYER_FIELDS, ['conclusion', 'detail', 'rerouted']);
+    assert.deepEqual(LAYER_FIELDS, ['conclusion', 'detail', 'rerouted', 'reroutedNoOwner']);
     const layered = sanitizeRecord({
         runId: 'run-layers',
         layers: { conclusion: 3, detail: 2, rerouted: 1, 未知键: 9, content: '正文不该借道进来' },

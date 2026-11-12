@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-persona-memory-consolidate",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "DSH 记忆自动沉淀（附属插件）：回合结束只写 L0 暂存，攒够 6 轮/8000 字符后一次抽取成结论式条目，经主插件 store 的校验与闸口写进 JOURNAL.jsonl / FACT.md / MEMORY.md；撞限只降级 JOURNAL，不自行压缩",
   "type": "module",
   "main": "./lib/index.js",
@@ -44,7 +44,7 @@
     "node": ">=22"
   },
   "peerDependencies": {
-    "@dsh-external/dsh-persona-memory": ">=0.7.0 <0.13.0",
+    "@dsh-external/dsh-persona-memory": ">=0.7.0 <0.14.0",
     "cordis": ">=4.0.0-rc <5"
   },
   "dependencies": {

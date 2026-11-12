@@ -197,8 +197,13 @@ try {
     // 用一个独立的 pending 根：前面几组用例故意留下了「未消费」的桶（非法 JSON / 门槛未到 / 预算拒绝），
     // 混进来就数不清「这次到底跑了几个桶」。
     const allDir = join(home, 'pending-all');
-    seedRows({ pendingDir: allDir, bucket: 'ws-7', sessionId: 'session-g', count: 6 });
-    seedRows({ pendingDir: allDir, bucket: 'ws-8', sessionId: 'session-h', count: 6 });
+    /*
+     * 归属兜底上线后（P0-A）：未归属批次（cwd 未知）的 global 候选会改判 JOURNAL、不再写
+     * FACT。这条用例要验的是「逐桶跑 + 共用一次锁」，所以给两个桶真实的 cwd/注册表路径，
+     * 让它们保持「归属已知 ⇒ 照常写 FACT」的老语义。
+     */
+    seedRows({ pendingDir: allDir, bucket: 'ws-7', sessionId: 'session-g', count: 6, cwd: projectDir });
+    seedRows({ pendingDir: allDir, bucket: 'ws-8', sessionId: 'session-h', count: 6, cwd: projectDir });
     /* 内容刻意拉开（相似度 < 0.45），两个桶都该走 ADD；相等的正文会被跨池闸口判成
      * near-duplicate——那正好是「同一条结论被写两遍」的现场，不能拿它当「两桶都跑了」的证据。 */
     const replies = ['第一桶写入：本地打包流程已核对完成', '第二桶写入：界面配色改成黛青色'];
@@ -219,7 +224,12 @@ try {
             }),
         }),
         config: { dryRun: false },
-        registry: { workspaces: { 'ws-7': { path: '', title: '工作区七', sessionIds: ['session-g'] } } },
+        registry: {
+            workspaces: {
+                'ws-7': { path: projectDir, title: '工作区七', sessionIds: ['session-g'] },
+                'ws-8': { path: projectDir, title: '工作区八', sessionIds: ['session-h'] },
+            },
+        },
     });
     perBucket.pendingDir = allDir;
 
@@ -412,8 +422,10 @@ try {
         model: fakeModel({ extraction: JSON.stringify({ memories: [{ scope: 'global', content: '这条会被 store 判成降级', confidence: 'high' }] }) }),
         config: { dryRun: false },
     });
-    seedRows({ bucket: 'ws-demote-string', sessionId: 'session-demote-string', count: 6 });
-    const stringDemoted = await runL1({ runtime: stringDemoteRuntime, bucket: 'ws-demote-string', now: NOW + 160 });
+    /* 归属兜底上线后（P0-A）：cwd 未知时 global 候选会先被改判 JOURNAL、根本走不到 store
+     * 的降级路径。这条用例验的是 store 的 `demoted:'journal'` 落账，所以给真实 cwd。 */
+    seedRows({ bucket: 'ws-demote-string', sessionId: 'session-demote-string', count: 6, cwd: projectDir });
+    const stringDemoted = await runL1({ runtime: stringDemoteRuntime, bucket: { workspaceId: 'ws-demote-string', path: projectDir }, now: NOW + 160 });
     assert.equal(stringDemoted.counts.demoted, 1, '字符串 journal 也是降级');
     assert.equal(stringDemoted.counts.failed, 0);
     assert.equal(stringDemoted.counts.written, 0);

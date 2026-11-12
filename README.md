@@ -624,6 +624,27 @@ runlog 的 `detail`；`/status` 的「上次失败」直接显示它，并给一
 - **兼容**：主插件没有新字段 / 新方法时写入与 0.3.2 完全一样；peer 上界升到 `<0.12.0`（主插件 0.11.0）。
   不新增运行时依赖，正文格式（FACT / MEMORY）零变化。
 
+## 变更（0.5.0）：归属兜底 + 拒绝不再丢内容
+
+- **归属兜底**（`pipeline.routeByOwnership()`）：工作区归因不到（`_unassigned` 桶 / 注册表查不到，
+  即 `writeCwd === ''`）时，`global` 与 `project` 候选**一律改判 `journal`** —— 不丢弃、不占静态槽。
+  以前这种批次能直接写全局 FACT（本机 FACT 里 15 行英语语法污染就是这条路径），`project` 则被主插件
+  拒掉、又因为 `failed > 0` 挡住消费 ⇒ 同一批素材反复重跑。runlog `layers` 在真发生时才多一个
+  `reroutedNoOwner`（老的三键形状不变）。
+- **提示词带真实 cwd**（`extractor.buildExtractionPrompt`）：以前只说「project = 跟当前目录有关」却不给
+  目录值，模型只能猜；现在贴真实路径，未知时明确要求「这种批次一律写 scope=journal，不要写 global / project」。
+- **拒绝降级**（`writer.rejectionOf()` / `handleRejected()`）：主插件 `assertEntry` 抛
+  `MEMORY_ENTRY_REJECTED` 时按 `details.demote` 分派 —— `journal` ⇒ 补写一次 JOURNAL（记 demoted，
+  runlog 带 `demoted:store-rejected:<reason>`）；`drop` ⇒ 记 FAILED 且**带 `details.reason`**。
+  旧实现的 `error.code ?? details.reason` 因为 code 非空，永远取不到 reason。
+- **永久拒绝不挡消费**（`writer.isRetryableFailure()` / `pipeline` 的 `retryableFailures === 0`）：
+  永久拒绝重试一万次还是同一个结果，拿它挡消费只会把同一批素材钉在暂存区（本机实测 9 行 / 5323 字符
+  重跑 13 次、25 次调用）；临时失败（LLM / 超时 / 写盘 IO）照旧阻塞、下轮重试。批次状态仍按
+  「有 failed 就 FAIL」记，消费判定与展示口径刻意分开（不假装成功）。
+- **测试**：24 个用例全绿（新增 `test/ownership.test.mjs`、`test/reject-consume.test.mjs`）；
+  3 个既有用例的 fixture 按「归属已知才写静态槽」的新语义做了最小调整。
+- **peer**：`@dsh-external/dsh-persona-memory` 上界升到 `<0.14.0`（主插件 0.13.0）。
+
 ## 已知边界（0.3.0）
 
 - **自动触发已接线，但只写 L0 与「门槛达标才跑一次」**：`turn/end` 写进 pending 是纯本地追加；

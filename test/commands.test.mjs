@@ -34,7 +34,12 @@ try {
     const model = fakeModel({ extraction: EXTRACTION });
 
     let prepared = 0;
-    const runtime = makeRuntime({ store, model, config: { dryRun: false } });
+    /*
+     * 归属兜底上线后（P0-A）：桶必须能反查到工作区，否则 global 候选会被改判 JOURNAL、
+     * 命令层的「真写盘」断言就无从谈起。这里按真实环境补一条注册表（路径 = projectDir）。
+     */
+    const registry = { workspaces: { 'ws-cmd': { path: projectDir, title: '命令测试', sessionIds: ['session-cmd'] } } };
+    const runtime = makeRuntime({ store, model, config: { dryRun: false }, registry });
     const commands = createCommands(runtime, {
         logger: { info() {}, warn() {} },
         // 与 index.js 的 prepare 同形：命令执行时才把模型接进 runtime。
