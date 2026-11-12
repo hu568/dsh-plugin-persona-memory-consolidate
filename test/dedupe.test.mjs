@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import { readUnconsumed } from '../lib/pending.js';
 import { runL1 } from '../lib/pipeline.js';
 import { readLastRun } from '../lib/runlog.js';
-import { buildDedupePrompt, MAX_DEDUPE_CANDIDATES, DEDUPE_MAX_OUTPUT_TOKENS, DEDUPE_REASONING_EFFORT, DEDUPE_REASON, adjudicateNearDuplicates, parseDedupeVerdict } from '../lib/dedupe.js';
+import { buildDedupePrompt, MAX_DEDUPE_CANDIDATES, DEDUPE_MAX_NEIGHBORS, DEDUPE_MAX_PROMPT_CHARS, DEDUPE_MAX_OUTPUT_TOKENS, DEDUPE_REASONING_EFFORT, DEDUPE_REASON, adjudicateNearDuplicates, parseDedupeVerdict } from '../lib/dedupe.js';
 import { NOW, makeHome, makeRuntime, memoryStore, seedRows } from './_helpers.mjs';
 
 /* 池：四条**与候选不语义重复**的已有条目；其中 ① 是候选 ② 的「同事实、不同措辞」版本。 */
@@ -95,7 +95,12 @@ function spyBudget() {
 async function runOnce(home, name, options = {}) {
     const projectDir = join(home, name);
     mkdirSync(projectDir, { recursive: true });
-    const store = memoryStore({ home, projectDir, factText: FACT_SEED });
+    const store = memoryStore({
+        home,
+        projectDir,
+        factText: options.factText ?? FACT_SEED,
+        memoryText: options.memoryText,
+    });
     const model = options.model ?? scriptedModel({ extraction: EXTRACTION, dedupe: DEDUPE_ANSWER });
     const budget = options.budget ?? spyBudget();
     const bucket = `ws-${name}`;
@@ -125,12 +130,19 @@ async function runOnce(home, name, options = {}) {
 /* ── 0. 纯函数层：prompt 形状 / 解析宽容度 ── */
 {
     const prompt = buildDedupePrompt([
-        { index: 3, content: '候选甲的正文', neighbors: [{ id: 'a', text: '旧条目一' }, { id: 'b', text: '旧条目二' }] },
+        {
+            index: 3,
+            content: '候选甲的正文',
+            neighbors: [
+                { id: 'a', scope: 'fact', text: '旧条目一' },
+                { id: 'b', scope: 'memory', text: '旧条目二' },
+            ],
+        },
     ]);
     assert.ok(prompt.includes('近义改写'), 'prompt 必须点明判的是近义改写');
     assert.ok(prompt.includes('同主题的不同结论'), '必须显式列出「不算重复」的反例（否则模型爱把同主题当同事实）');
     assert.ok(prompt.includes('[3] 候选甲的正文'), '候选必须带原下标');
-    assert.ok(prompt.includes('近邻 0: 旧条目一') && prompt.includes('近邻 1: 旧条目二'), '两个近邻都要进 prompt');
+    assert.ok(prompt.includes('近邻 0【FACT】: 旧条目一') && prompt.includes('近邻 1【MEMORY】: 旧条目二'), '两个近邻都要进 prompt 且带作用域标签');
     assert.ok(prompt.includes('"duplicates"'), '只要求 JSON 对象');
 
     assert.deepEqual(parseDedupeVerdict('{"duplicates":[]}').duplicates, []);
@@ -160,6 +172,78 @@ async function runOnce(home, name, options = {}) {
         callModel: async () => { asked += 1; return '{"duplicates":[]}'; },
     });
     assert.equal(asked, 0, 'enabled:false 不许调用模型');
+}
+
+/*
+ * ── 0b. 0.7.1：近邻必须覆盖「同作用域 + 跨作用域」──
+ *
+ * 审计现场：FACT 池里两条无关条目 BM25 排前（F24 的 top1 是 F5），真正的重复其实躺在
+ * 项目 MEMORY（M43 的 top1 反而是 M58）——旧实现只取池内 top-2，等于让模型对着一堆
+ * 无关条目判重，永远判不出跨作用域的那条重复。下面两个方向各钉一条。
+ */
+{
+    const FACT_NOISE = [
+        { id: 'f1', scope: 'fact', text: '依赖装载顺序由 package.json 决定' },
+        { id: 'f2', scope: 'fact', text: '依赖版本锁在 lock 文件里' },
+    ];
+    const MEMORY_TRUTH = [{ id: 'm1', scope: 'memory', text: '插件依赖一律用 tgz 包，不要 pnpm install' }];
+    let prompt = '';
+    const verdict = await adjudicateNearDuplicates({
+        candidates: [{ scope: 'global', content: '依赖装载统一走压缩包，别用包管理器' }],
+        pool: [...FACT_NOISE, ...MEMORY_TRUTH],
+        callModel: async (request) => {
+            prompt = String(request?.prompt ?? '');
+            return '{"duplicates":[]}';
+        },
+    });
+    assert.equal(verdict.checked, 1);
+    assert.ok(prompt.includes('依赖装载顺序由 package.json 决定'), '同作用域（FACT）近邻要在');
+    assert.ok(prompt.includes('插件依赖一律用 tgz 包'), '跨作用域（MEMORY）那条真重复必须在——否则模型永远判不出来');
+    assert.ok(prompt.includes('【FACT】') && prompt.includes('【MEMORY】'), 'scopeLabel 要生效（模型能看出作用域）');
+
+    /* 反方向：project 候选 + 真重复在 FACT（内存侧塞满 3 条噪声，旧口径 top-2 会被噪声占满） */
+    const memoryNoise = [
+        { id: 'n1', scope: 'memory', text: '工程目录名固定为 project-root' },
+        { id: 'n2', scope: 'memory', text: '依赖锁文件不许手改' },
+        { id: 'n3', scope: 'memory', text: '工程内所有路径一律用相对路径' },
+    ];
+    let promptB = '';
+    await adjudicateNearDuplicates({
+        candidates: [{ scope: 'project', content: '工程依赖一律用 tarball 装，别走包管理器' }],
+        pool: [{ id: 'g1', scope: 'fact', text: '依赖用 tarball 装，不用 pnpm install' }, ...memoryNoise],
+        callModel: async (request) => {
+            promptB = String(request?.prompt ?? '');
+            return '{"duplicates":[]}';
+        },
+    });
+    assert.ok(promptB.includes('依赖用 tarball 装，不用 pnpm install'), 'project 候选的跨作用域（FACT）真重复也要在');
+    assert.ok(promptB.includes('【FACT】') && promptB.includes('【MEMORY】'), '两个方向都要带标签');
+
+    /* 上限：一条候选最多 4 个近邻（同 2 + 跨 2）；build 再切片一次，多给也不许超 */
+    assert.equal(DEDUPE_MAX_NEIGHBORS, 4);
+    const tooMany = buildDedupePrompt([{
+        index: 0,
+        content: '候选',
+        neighbors: Array.from({ length: 6 }, (_, i) => ({ id: `x${i}`, scope: i % 2 === 0 ? 'fact' : 'memory', text: `近邻正文${i}` })),
+    }]);
+    assert.ok(tooMany.includes('近邻 3【') && !tooMany.includes('近邻 4【'), '超过 4 条必须截断');
+
+    /* 越界截断：超长正文 / 超长近邻不炸，且被截到预算内（判重不需要完整上下文） */
+    const huge = buildDedupePrompt([{
+        index: 0,
+        content: '长'.repeat(5000),
+        neighbors: [{ id: 'z', scope: 'fact', text: '长'.repeat(5000) }],
+    }]);
+    assert.ok(huge.length < 3000, `超长输入要截断，不能整段塞进 prompt：${huge.length}`);
+    assert.ok(huge.includes('长'.repeat(200)) && !huge.includes('长'.repeat(201)), '正文按 200 字保留、超出的切掉');
+
+    const crowded = buildDedupePrompt(Array.from({ length: 40 }, (_, i) => ({
+        index: i,
+        content: '候'.repeat(200),
+        neighbors: Array.from({ length: 4 }, (_, k) => ({ id: `${i}-${k}`, scope: 'fact', text: '邻'.repeat(160) })),
+    })));
+    assert.ok(crowded.length <= DEDUPE_MAX_PROMPT_CHARS + 400, `总预算要生效：${crowded.length}`);
+    assert.ok(crowded.includes('候选清单超出上下文预算'), '截断要留痕（没列出的候选本次不判）');
 }
 
 const { home, cleanup } = makeHome('pmc-dedupe');
@@ -239,6 +323,33 @@ try {
     assert.ok(!String(mixedRequest.prompt).includes('这次又确认了一遍长期记忆不存过程日志'), 'journal 候选不许进判重 prompt');
     assert.ok(String(mixedRequest.prompt).includes(CAND_NEW_A), 'global 候选要进判重 prompt');
     assert.equal(mixed.run.dedupe.checked, 1, '只送 1 条（journal 跳过）');
+
+    /*
+     * ── 5b. 端到端跨作用域（0.7.1 回归）──
+     *
+     * 真重复**只**躺在项目 MEMORY 里：FACT 池那两条同词根、BM25 分更高（旧口径会占满 top-2）。
+     * 断言判重 prompt 里能看到 MEMORY 那条 —— 这是审计「正确旧条目不在近邻里」的端到端钉子。
+     */
+    const CROSS_MEMORY_OLD = '插件依赖一律用 tgz 包，不要 pnpm install';
+    const CROSS_CAND = '依赖装载统一走压缩包，别用包管理器';
+    const crossModel = scriptedModel({
+        extraction: JSON.stringify({ memories: [{ scope: 'global', content: CROSS_CAND, confidence: 'high' }] }),
+        dedupe: '{"duplicates":[{"index":0,"of":0,"why":"同一事实：用压缩包装，不用包管理器"}]}',
+    });
+    const cross = await runOnce(home, 'dup-cross-scope', {
+        model: crossModel,
+        factText: `## 约定\n\n- 依赖装载顺序由 package.json 决定\n- 依赖版本锁在 lock 文件里\n`,
+        memoryText: `# MEMORY.md\n\n1. ${CROSS_MEMORY_OLD}\n`,
+    });
+    assert.equal(cross.run.status, 'OK', `跨作用域判重不该失败：${cross.run.reason}`);
+    assert.equal(cross.run.calls, 2, '抽取 1 次 + 判重 1 次（低相似度，归并不再裁决）');
+    assert.equal(cross.run.dedupe.duplicates, 1, '模型判掉了那条跨作用域重复');
+    assert.equal(cross.run.counts.noop, 1, '改判 NOOP（不许静默消失）');
+    assert.equal(cross.run.counts.written, 0, '没有新条目要写');
+    const crossRequest = crossModel.requests.find((request) => String(request?.prompt ?? '').includes('候选与近邻：'));
+    assert.ok(String(crossRequest.prompt).includes(CROSS_MEMORY_OLD), '项目 MEMORY 里那条真重复必须进判重 prompt（0.7.1 修复点）');
+    assert.ok(String(crossRequest.prompt).includes('【MEMORY】'), '跨作用域近邻要带 MEMORY 标签');
+    assert.ok(!cross.factText().includes(CROSS_CAND), '被判重复的候选一个字都不许写进 FACT');
 } finally {
     cleanup();
 }

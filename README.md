@@ -265,7 +265,7 @@ peer 范围是 `>=0.7.0 <0.12.0`：覆盖主插件 **0.7.x–0.11.x**。0.10.0 �
 | `dryRun` | `false` | 干跑：只出报告不落盘。默认关闭；一次性演练用 `/memory-consolidate dry` |
 | `gateEnabled` | `true` | 确定性写入闸口总开关；`false` = 整批放行，runlog 不写 `gate` 计数（线上误杀时的一键开关）。0.3.0 起跨池近重复也随它一起停 |
 | `crossPoolDedup` | `true` | **0.3.0**：跨池近重复预筛。`false` = 只关这一道（同批去重 / 空壳过滤照旧），归并层自己的池内预筛不受影响 |
-| `dedupeModel` | `true` | **0.7.0**：近重复**模型裁决**。每批多花 1 次小调用（512 输出上限、最低推理档），把候选与各自 top-2 近邻交给模型判；判成重复的改判 NOOP（`reason=model-near-duplicate`）。`false` = 一次都不调用（回到 0.6.1 行为） |
+| `dedupeModel` | `true` | **0.7.0**：近重复**模型裁决**。每批多花 1 次小调用（512 输出上限、最低推理档），把候选与「同作用域 top-2 + 跨作用域 top-2」（0.7.1）近邻交给模型判；判成重复的改判 NOOP（`reason=model-near-duplicate`）。`false` = 一次都不调用（回到 0.6.1 行为） |
 | `supersedeOnUpdate` | `true` | **0.3.0**：UPDATE 先写新条目、成功后才标记旧条目失效；`false` = 只走原子替换。主插件无 `supersedeEntry` 时自动回落替换 |
 | `retryOnTruncate` | `true` | **0.4.0**：截断重试。`LLM_TRUNCATED` 且补括号抢救不回来时，同 prompt 再调一次并把推理等级压到模型支持的最低档；只重试一次，仍失败按原逻辑整次 FAIL |
 | `scope` | `'both'` | `journal` = 只写 JOURNAL；`both` = JOURNAL + FACT/MEMORY |
@@ -334,7 +334,7 @@ peer 范围是 `>=0.7.0 <0.12.0`：覆盖主插件 **0.7.x–0.11.x**。0.10.0 �
 | `consolidate.redact` | 高级 | 开关 | 开 | 敏感串打码 |
 | `consolidate.gateEnabled` | 高级 | 开关 | 开 | 结论质量闸口。关掉即整批放行（跨池近重复也停），runlog 也不再记 `gate` 分类计数 |
 | `consolidate.crossPoolDedup` | 高级 | 开关 | 开 | **0.3.0**：跨池近重复拦截。完全相同或相似度 ≥95% 的结论直接丢弃并计入闸口「跨池近重复」；45%–95% 交给模型裁决；池空或打分异常放行。只管字面重复 |
-| `consolidate.dedupeModel` | 高级 | 开关 | 开 | **0.7.0**：近重复模型裁决。每批多花 1 次小调用判「同一事实的等价 / 上下位改写」，判重复的改判 NOOP（记 `model-near-duplicate`）；失败一律全部放行。统计阈值在这件事上已证伪 |
+| `consolidate.dedupeModel` | 高级 | 开关 | 开 | **0.7.0**：近重复模型裁决。每批多花 1 次小调用判「同一事实的等价 / 上下位改写」（0.7.1 起近邻覆盖同作用域 + 跨作用域），判重复的改判 NOOP（记 `model-near-duplicate`）；失败一律全部放行 |
 | `consolidate.supersedeOnUpdate` | 高级 | 开关 | 开 | **0.3.0**：改写走失效标记。先写新正文，成功后才把旧条目标为失效（原文保留可审计、可恢复）；任一步失败回退原子替换 |
 | `consolidate.retryOnTruncate` | 高级 | 开关 | 开 | **0.4.0**：截断后降推理等级重试。输出被 max-tokens 截断且抢救不回来时，用同一份 prompt 再调一次（推理等级压到模型支持的最低档）；只重试一次，仍失败则本次一个字都不写 |
 | `consolidate.pendingMaxAgeDays` | 高级 | 文本 | `30` | 暂存最长保留天数（≥1，整数） |
@@ -486,7 +486,7 @@ node test/sources.test.mjs      # 三档数据源与降级链、pending 桶列�
 node test/runlog.test.mjs       # 字段白名单、打码、滚动、detail/gate/layers、watermarks.limit 对象形状、影子运行不进真实写入统计
 node test/commands.test.mjs     # status/dry/run/cross/migrate/rollback 文案、抽取路线、上次失败、分桶分裂、跨池近重复标签
 node test/autotrigger.test.mjs  # turn/end 写 L0、门槛微任务消费、状态兜底、销毁收尾、兜底扫描、退避、桶黏性
-node test/dedupe.test.mjs       # 0.7.0 判重：候选改判 NOOP、抛错/垃圾返回兜底、开关不调用、journal 跳过、512/最低推理档、预算补扣
+node test/dedupe.test.mjs       # 判重：候选改判 NOOP、抛错/垃圾返回兜底、开关不调用、journal 跳过、跨作用域近邻、截断、预算补扣
 node test/pipeline.test.mjs     # L1 闭环：happy path、闸口、跨池近重复、撞限降级、快照回滚、observe、分层路由/layers、importance、按真实 calls 记账
 node test/crosssession.test.mjs # L2：只认真实频次、项目专属不双写 global、只交 id 失效、逐桶、预算、observe
 node test/migrate.test.mjs      # 历史暂存回填：行文件合并、workspaceId 改写、游标取 max
@@ -691,6 +691,32 @@ runlog 的 `detail`；`/status` 的「上次失败」直接显示它，并给一
   按「多一次调用、detail 多一段」做了最小调整）。
 - **peer**：仍为 `>=0.7.0 <0.14.0`（本轮不动契约，只加一层写前判定）。
 
+## 变更（0.7.1）：近邻覆盖跨作用域 + 提示词补别名 / partial / 抽象层
+
+- **审计现场（这条会直接决定门控有效性）**：`DEDUPE_NEIGHBORS=2` 只给「**整个池**的 BM25 top-2」，
+  而真正要判的那条旧条目常常不在里面 —— F24 的 top1 是 F5（不相干）、M43 的 top1 是 M58。也就是说
+  模型看到的近邻里根本没有重复对象，再聪明也判不出重复（判重层等于空转）。
+- **改法（选 A，跨作用域保证 > 池内 top-4）**：新增 `pickNeighbors(content, candidateScope, pool)`，
+  按候选 scope 映射池 scope（`global → fact` / `project → memory`），**同作用域 top-2 + 另一作用域
+  top-2 = 最多 4 条**，正文去重（同一句话在两个作用域都存时只给一次，免得模型以为「有两处支持」）。
+  这样跨作用域的同一事实（F8↔M44 那种）一定在眼前，而不是被同作用域的无关条目挤掉。
+- **prompt 打作用域标签**：`buildDedupePrompt()` 用 `scopeLabel()` 给近邻标 `【FACT】` /
+  `【MEMORY】`，并在规则段说明「同一事实可能分别躺在两个作用域里，两边都要看」。
+- **提示词补 4 条判定口径**（对照原有 6 条去重后共 10 条）：
+  ① **实体别名**：缩写 / 全称 / 俗称 / 中英文名指同一个东西时先归一再判（DSH 与 DeepSeek Harness）；
+  ② **partial**：核心事实只重合一部分就算重复，**不要求整条等价**；
+  ③ **抽象层**：现象（「它老是超时」）/ 原则（「别把 deadline 定太紧」）/ 取舍（「宁少勿多」）说同一件事算重复；
+  ④ **上下位算重复，但同族不同数值 / 档位不算**（阈值 120 与 160、档位 2 与 4、topK 3 与 5 是两条结论）。
+  「不算重复」仍保留：同主题不同结论 / 冲突或更新 / 只共享术语或实体。
+- **截断不炸**（审计要求「越界截断不炸」）：候选正文切到 `DEDUPE_CANDIDATE_CHARS=200`、
+  近邻切到 `DEDUPE_NEIGHBOR_CHARS=160`、每条最多 `DEDUPE_MAX_NEIGHBORS=4` 条；整份 prompt 还有
+  `DEDUPE_MAX_PROMPT_CHARS=6000` 的总预算 —— 塞不下就少判几条（没列出的候选按「新结论」放行），
+  prompt 末尾留「候选清单超出上下文预算，已截断」。判重不需要完整上下文，超长只会把调用拖成超时。
+- **测试**：`test/dedupe.test.mjs` 追加 4 组 —— 同作用域 + 跨作用域近邻都进 prompt（两个方向各一条）、
+  `scopeLabel` 生效、超过 4 条近邻时截断、超长正文 / 40 条候选越界截断不炸；另加一条端到端回归：
+  「真重复只在项目 MEMORY 里」时判重 prompt 必须能看到它、且候选改判 NOOP 不写 FACT。
+  全量 **26** 个用例通过。
+
 ## 已知边界（0.3.0）
 
 - **自动触发已接线，但只写 L0 与「门槛达标才跑一次」**：`turn/end` 写进 pending 是纯本地追加；
@@ -740,7 +766,7 @@ runlog 的 `detail`；`/status` 的「上次失败」直接显示它，并给一
 | `lib/mode.js` | 运行档位 `off` / `observe` / `auto` 的唯一口径（含与 `enabled` 的优先级） |
 | `lib/extractor.js` | 抽取/裁决提示词与模型 JSON 解析 |
 | `lib/merger.js` | 预筛（BM25 近邻）、算子校验、冲突规则 |
-| `lib/dedupe.js` | **0.7.0** 近重复模型裁决：top-2 近邻 + 一次小调用判等价改写，失败全部放行 |
+| `lib/dedupe.js` | **0.7.0** 近重复模型裁决：同/跨作用域各 top-2 近邻（0.7.1）+ 一次小调用判等价改写，失败全部放行 |
 | `lib/gate.js` | 确定性写入闸口：空壳/过程/太短/缺时点/同批重复，只丢不改写 |
 | `lib/migrate.js` | 历史暂存回填：计划、行文件合并、`workspaceId` 改写、游标迁移 |
 | `lib/pending.js` | L0 暂存行读写、滚动压实、`resolveBucket()` 桶黏性、`findBucketSplits()` |
