@@ -19,6 +19,7 @@ import { LLM_TRUNCATED } from '../lib/llm.js';
 import { readCursor } from '../lib/cursor.js';
 import { archivePath, readRows, readUnconsumed } from '../lib/pending.js';
 import { latestRunId, rollbackRun, runAllBuckets, runL1, screenCrossPool, snapshotFiles, attachImportance, routeByGranularity } from '../lib/pipeline.js';
+import { mergeCandidates } from '../lib/merger.js';
 import { readLastRun } from '../lib/runlog.js';
 import { NOW, fakeModel, fakeStore, makeHome, makeRuntime, memoryStore, seedRows, sha256 } from './_helpers.mjs';
 
@@ -733,6 +734,31 @@ try {
     );
     assert.deepEqual(attached.map((op) => op.importance), [5, 3, 2]);
     assert.equal(attached[1].content, '模型改写过的正文', '正文一个字都不许改');
+
+    /* 26b. E4：归并算子带候选下标，正文被改写也能回填 importance（不再掉到缺省 3） */
+    const mergedForIndex = await mergeCandidates({
+        candidates: [
+            { content: '结论甲', scope: 'global', ts: NOW },
+            { content: '结论乙', scope: 'global', ts: NOW },
+        ],
+        pool: [],
+    });
+    assert.equal(mergedForIndex.ok, true);
+    assert.deepEqual(mergedForIndex.ops.map((op) => op.sourceIndex), [0, 1], 'ADD 算子必须带候选下标');
+    const indexAttached = attachImportance(
+        [
+            { op: 'ADD', content: '结论甲（被模型改写过）', sourceIndex: 0 },
+            { op: 'ADD', content: '结论乙（也被改写过）', sourceIndex: 1 },
+            { op: 'ADD', content: '结论乙' },
+            { op: 'ADD', content: '表里没有的正文', sourceIndex: 9 },
+        ],
+        [
+            { content: '结论甲', importance: 5 },
+            { content: '结论乙', importance: 2 },
+        ],
+    );
+    assert.deepEqual(indexAttached.map((op) => op.importance), [5, 2, 2, 3], '下标优先 / 正文匹配兜底 / 都没有用缺省 3');
+    assert.equal(indexAttached[0].content, '结论甲（被模型改写过）', '回填只补 importance，正文一字不改');
 
     /* 27. 端到端：detail / 低重要性被改判进 JOURNAL，结论照写 FACT，layers 落 runlog */
     const layerDir = join(home, 'proj-layers');
