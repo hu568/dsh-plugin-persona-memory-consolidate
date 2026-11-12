@@ -80,12 +80,17 @@ try {
 
     /* ── DESIGN §14.2：`layers` 结构化分层计数（只留数字，未知键不漏进去） ── */
     assert.ok(RECORD_FIELDS.includes('layers'), 'layers 必须在记录白名单里（否则写了也会被丢掉）');
-    assert.deepEqual(LAYER_FIELDS, ['conclusion', 'detail', 'rerouted', 'reroutedNoOwner']);
+    assert.deepEqual(LAYER_FIELDS, ['conclusion', 'detail', 'rerouted', 'reroutedNoOwner', 'reroutedLong']);
     const layered = sanitizeRecord({
         runId: 'run-layers',
         layers: { conclusion: 3, detail: 2, rerouted: 1, 未知键: 9, content: '正文不该借道进来' },
     });
-    assert.deepEqual(layered.layers, { conclusion: 3, detail: 2, rerouted: 1 }, 'layers 只留三个已知数字键');
+    assert.deepEqual(layered.layers, { conclusion: 3, detail: 2, rerouted: 1 }, 'layers 只留已知数字键（没给的键不补）');
+    assert.deepEqual(
+        sanitizeRecord({ layers: { conclusion: 3, reroutedLong: 2 } }).layers,
+        { conclusion: 3, reroutedLong: 2 },
+        'reroutedLong（0.5.0 长度门）必须也在白名单里，否则写了也会被静默丢掉',
+    );
     assert.equal(sanitizeRecord({ layers: {} }).layers, undefined, '空 layers 不落盘');
     assert.equal(sanitizeRecord({ layers: { conclusion: '3' } }).layers, undefined, '字符串不算数字');
     assert.equal(sanitizeRecord({ layers: { 未知键: 3 } }).layers, undefined, '全是未知键 ⇒ 整块丢掉');

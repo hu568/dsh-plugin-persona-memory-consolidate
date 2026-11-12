@@ -27,7 +27,7 @@ import {
 } from '../lib/extractor.js';
 import { LLM_TRUNCATED } from '../lib/llm.js';
 
-/* 规则正文必须与 02 §4.1 + DESIGN v3 §14.1 一致（8 条规则 + 输出格式） */
+/* 规则正文必须与 02 §4.1 + DESIGN v3 §14.1 + 0.5.0 格式门一致（10 条规则 + 输出格式） */
 const ruleLines = EXTRACTION_RULES.split('\n');
 assert.equal(ruleLines[0], '从下面的对话里，抽出值得长期记住的结论。');
 assert.ok(EXTRACTION_RULES.includes('1. 一条一个结论，第三人称陈述句。'));
@@ -43,11 +43,17 @@ assert.ok(EXTRACTION_RULES.includes('scope=journal'));
 /* DESIGN §14.1 规则 8：每条标 kind 与 importance */
 assert.ok(EXTRACTION_RULES.includes('8. 每条标 kind 与 importance'));
 assert.ok(EXTRACTION_RULES.includes('kind=detail 或 importance≤2 的 scope 必须写 journal'));
+/* 0.5.0 规则 9 / 10（格式门）：一条一个结论 + 正文 ≤100 字；编年史一律 journal */
+assert.ok(EXTRACTION_RULES.includes('9. 每条只写一个结论，正文 ≤100 字'), '规则 9：一条一个结论 + 字数上限');
+assert.ok(EXTRACTION_RULES.includes('超了拆成多条短条目'), '规则 9：超长要拆条，不许写成一整段');
+assert.ok(EXTRACTION_RULES.includes('10. 版本演进史、实现过程、调试记录、文件清单一律 scope=journal'), '规则 10：编年史不许进静态槽');
+assert.ok(EXTRACTION_RULES.includes('不许写进 FACT / MEMORY'), '规则 10：明确禁止写进静态槽');
 assert.equal(
     ruleLines[ruleLines.length - 1],
     '{"memories":[{"scope":"global|project|journal","content":"...","confidence":"high|medium|low","kind":"conclusion|detail","importance":3}]}',
 );
-assert.ok(ruleLines.length <= 15, `§4.1 说「约 15 行」，实得 ${ruleLines.length} 行`);
+/* 0.5.0 新增规则 9 / 10 后为 16 行：上限从 15 调到 18（仍守住「短提示词」的意图，别让规则无限长） */
+assert.ok(ruleLines.length <= 18, `§4.1 说「约 15 行」（0.5.0 加两条格式规则后 ≤18），实得 ${ruleLines.length} 行`);
 assert.ok(EXTRACTION_RULES.includes('不要解释，不要代码块围栏'));
 
 /* 对话渲染 */
