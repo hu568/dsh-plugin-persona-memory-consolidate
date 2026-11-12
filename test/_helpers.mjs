@@ -169,6 +169,7 @@ export function consolidateConfig(overrides = {}) {
         dryRun: true,
         gateEnabled: true,
         crossPoolDedup: true,
+        dedupeModel: true,
         supersedeOnUpdate: true,
         retryOnTruncate: true,
         scope: 'both',
@@ -463,13 +464,22 @@ export function seedRows(spec) {
     return { bucket: spec.bucket, sessionId: spec.sessionId, turns: count };
 }
 
-/** 假模型：按 prompt 形状决定回答「抽取」还是「裁决」。 */
+/**
+ * 假模型：按 prompt 形状决定回答「抽取」/「归并裁决」/「近重复判重」（0.7.0 新增第三类）。
+ *
+ * 判重默认回 `{"duplicates":[]}`（= 一条都不判重复），所以老用例的写入结果不变，
+ * 只是**多一次调用**；需要固定判重答案时用 `replies.dedupe`。
+ */
 export function fakeModel(replies = {}) {
     const calls = [];
     const model = async (request) => {
-        calls.push(String(request?.prompt ?? ''));
-        const adjudication = String(request?.prompt ?? '').includes('下面是已存在的记忆条目');
-        const reply = adjudication ? (replies.adjudication ?? '{"ops":[]}') : (replies.extraction ?? '{"memories":[]}');
+        const prompt = String(request?.prompt ?? '');
+        calls.push(prompt);
+        const dedupe = prompt.includes('候选与近邻：');
+        const adjudication = prompt.includes('下面是已存在的记忆条目');
+        const reply = dedupe
+            ? (replies.dedupe ?? '{"duplicates":[]}')
+            : (adjudication ? (replies.adjudication ?? '{"ops":[]}') : (replies.extraction ?? '{"memories":[]}'));
         return typeof reply === 'function' ? reply(request) : reply;
     };
     model.calls = calls;

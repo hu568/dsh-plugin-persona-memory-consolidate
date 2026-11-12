@@ -254,9 +254,9 @@ peer 范围是 `>=0.7.0 <0.12.0`：覆盖主插件 **0.7.x–0.11.x**。0.10.0 �
 
 ## 配置
 
-`cordis.patch.yml` 里那一行就是默认值。`Config` 共 **37 个键**：组合补丁写了其中 **30 个**，
-`gateEnabled` / `crossPoolDedup` / `supersedeOnUpdate` / `retryOnTruncate` / `maxOutputTokens` /
-`callTimeoutMs` 只走 schema 默认值（`test/wiring.test.mjs` 逐个比对 `Config` 默认值）：
+`cordis.patch.yml` 里那一行就是默认值。`Config` 共 **38 个键**：组合补丁写了其中 **30 个**，
+`gateEnabled` / `crossPoolDedup` / `dedupeModel` / `supersedeOnUpdate` / `retryOnTruncate` /
+`maxOutputTokens` / `callTimeoutMs` 只走 schema 默认值（`test/wiring.test.mjs` 逐个比对 `Config` 默认值）：
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
@@ -265,6 +265,7 @@ peer 范围是 `>=0.7.0 <0.12.0`：覆盖主插件 **0.7.x–0.11.x**。0.10.0 �
 | `dryRun` | `false` | 干跑：只出报告不落盘。默认关闭；一次性演练用 `/memory-consolidate dry` |
 | `gateEnabled` | `true` | 确定性写入闸口总开关；`false` = 整批放行，runlog 不写 `gate` 计数（线上误杀时的一键开关）。0.3.0 起跨池近重复也随它一起停 |
 | `crossPoolDedup` | `true` | **0.3.0**：跨池近重复预筛。`false` = 只关这一道（同批去重 / 空壳过滤照旧），归并层自己的池内预筛不受影响 |
+| `dedupeModel` | `true` | **0.7.0**：近重复**模型裁决**。每批多花 1 次小调用（512 输出上限、最低推理档），把候选与各自 top-2 近邻交给模型判；判成重复的改判 NOOP（`reason=model-near-duplicate`）。`false` = 一次都不调用（回到 0.6.1 行为） |
 | `supersedeOnUpdate` | `true` | **0.3.0**：UPDATE 先写新条目、成功后才标记旧条目失效；`false` = 只走原子替换。主插件无 `supersedeEntry` 时自动回落替换 |
 | `retryOnTruncate` | `true` | **0.4.0**：截断重试。`LLM_TRUNCATED` 且补括号抢救不回来时，同 prompt 再调一次并把推理等级压到模型支持的最低档；只重试一次，仍失败按原逻辑整次 FAIL |
 | `scope` | `'both'` | `journal` = 只写 JOURNAL；`both` = JOURNAL + FACT/MEMORY |
@@ -332,7 +333,8 @@ peer 范围是 `>=0.7.0 <0.12.0`：覆盖主插件 **0.7.x–0.11.x**。0.10.0 �
 | `consolidate.subagent` | 高级 | 开关 | 关 | 子代理也沉淀 |
 | `consolidate.redact` | 高级 | 开关 | 开 | 敏感串打码 |
 | `consolidate.gateEnabled` | 高级 | 开关 | 开 | 结论质量闸口。关掉即整批放行（跨池近重复也停），runlog 也不再记 `gate` 分类计数 |
-| `consolidate.crossPoolDedup` | 高级 | 开关 | 开 | **0.3.0**：跨池近重复拦截。完全相同或相似度 ≥95% 的结论直接丢弃并计入闸口「跨池近重复」；45%–95% 交给模型裁决；池空或打分异常放行 |
+| `consolidate.crossPoolDedup` | 高级 | 开关 | 开 | **0.3.0**：跨池近重复拦截。完全相同或相似度 ≥95% 的结论直接丢弃并计入闸口「跨池近重复」；45%–95% 交给模型裁决；池空或打分异常放行。只管字面重复 |
+| `consolidate.dedupeModel` | 高级 | 开关 | 开 | **0.7.0**：近重复模型裁决。每批多花 1 次小调用判「同一事实的等价 / 上下位改写」，判重复的改判 NOOP（记 `model-near-duplicate`）；失败一律全部放行。统计阈值在这件事上已证伪 |
 | `consolidate.supersedeOnUpdate` | 高级 | 开关 | 开 | **0.3.0**：改写走失效标记。先写新正文，成功后才把旧条目标为失效（原文保留可审计、可恢复）；任一步失败回退原子替换 |
 | `consolidate.retryOnTruncate` | 高级 | 开关 | 开 | **0.4.0**：截断后降推理等级重试。输出被 max-tokens 截断且抢救不回来时，用同一份 prompt 再调一次（推理等级压到模型支持的最低档）；只重试一次，仍失败则本次一个字都不写 |
 | `consolidate.pendingMaxAgeDays` | 高级 | 文本 | `30` | 暂存最长保留天数（≥1，整数） |
@@ -484,6 +486,7 @@ node test/sources.test.mjs      # 三档数据源与降级链、pending 桶列�
 node test/runlog.test.mjs       # 字段白名单、打码、滚动、detail/gate/layers、watermarks.limit 对象形状、影子运行不进真实写入统计
 node test/commands.test.mjs     # status/dry/run/cross/migrate/rollback 文案、抽取路线、上次失败、分桶分裂、跨池近重复标签
 node test/autotrigger.test.mjs  # turn/end 写 L0、门槛微任务消费、状态兜底、销毁收尾、兜底扫描、退避、桶黏性
+node test/dedupe.test.mjs       # 0.7.0 判重：候选改判 NOOP、抛错/垃圾返回兜底、开关不调用、journal 跳过、512/最低推理档、预算补扣
 node test/pipeline.test.mjs     # L1 闭环：happy path、闸口、跨池近重复、撞限降级、快照回滚、observe、分层路由/layers、importance、按真实 calls 记账
 node test/crosssession.test.mjs # L2：只认真实频次、项目专属不双写 global、只交 id 失效、逐桶、预算、observe
 node test/migrate.test.mjs      # 历史暂存回填：行文件合并、workspaceId 改写、游标取 max
@@ -658,6 +661,36 @@ runlog 的 `detail`；`/status` 的「上次失败」直接显示它，并给一
 - **runlog**：`layers` 白名单扩到五个数字（`conclusion` / `detail` / `rerouted` /
   `reroutedNoOwner` / `reroutedLong`），仍然只在真发生时落键。
 
+## 变更（0.7.0）：近重复改由模型裁决 —— 统计阈值已证伪
+
+- **问题现场**：自动沉淀一次运行往项目 MEMORY 塞了 **6 条既有条目的近义改写**。写进门控只挡
+  「同批重复 / 字面完全重复」，管不到「上个月写过的结论换个说法又交上来」。
+- **两条统计路都证伪**（Lead 用真实数据做的实验，别再试第三次）：
+  - 字符 2-gram Dice：6 条重复 vs 已有条目最高只有 **0.131**，而真正的新结论反而 **0.261** —— 排序与人眼**完全反着来**；
+  - BM25 归一化（`merger.normalizedSimilarity`）：重复条 **0.074–0.203**，新结论 **0.059–0.505**，区间重叠到没法划线。
+  - 旧注释里「[0.45, 0.95) 的 ADJUDICATE 一律放行」在这件事上是空头承诺：近义改写连 0.45 都到不了。
+- **新层** `lib/dedupe.js`（`adjudicateNearDuplicates`）：在跨池预筛**之后**、归并**之前**，
+  给每条 `scope=global|project` 候选取 BM25 top-2 近邻（**不设阈值**，全部送），
+  一批最多 12 条**一次调用**判完；判成重复的候选**改判 NOOP**（稳定 `reason=model-near-duplicate`），
+  不是从数组里抹掉 —— 运行报告与 `counts.noop` 都看得见「这条为什么没写」。
+- **提示词**（`NEAR_DUPLICATE_RULES`，中文）：显式列「算重复」（换说法 / 语序调整 / 加修饰 / 上下位）
+  与「**不算**重复」（同主题不同结论 / 冲突更新 / 只共享术语）；只回一个 JSON 对象
+  `{"duplicates":[{"index","of","why"}]}`，不要解释段落、不要代码块围栏；近邻只给 **2 条**
+  （多了模型会把「同主题」当「同事实」）。
+- **成本与记账**：判重调用走 `pipeline` 的 `countingModel` 同一条路径 ⇒ `calls` +1、
+  `chargeExtra()` 按真实调用数补扣日配额（一次判重 = 一次调用，不许绕过 60 次/天）。
+  两个运行参数按「短文本判重」定：`maxOutputTokens: 512`（`llm.js` 新增单次覆盖）+ 最低推理档
+  `off`（不被支持时由 `pickSupportedReasoningEffort()` 退到模型最低档，绝不盲传）。
+- **降级纪律（绝不阻塞写入）**：模型没接线 / 抛错 / 超时 / 返回不是合法 JSON（含代码块围栏与寒暄，
+  靠 `parseModelJson()` 容错）/ 形状不对 ⇒ **全部原样放行** + 原因码进 runlog 的
+  `detail`（`dedupe:checked=N,dup=M,model-error|invalid-json|bad-shape`）。模型编出来的下标一律忽略。
+- **开关** `dedupeModel`（默认 `true`，设置页「自动沉淀 · 高级」）：`false` = 一次都不调用，
+  行为回到 0.6.1（**不是**更好的去重，只是更便宜）。`scope=journal` 候选不送判（事件流本来就允许同义反复）。
+- **测试**：**26** 个用例全绿（新增 `test/dedupe.test.mjs`：改判 NOOP / 抛错 / 垃圾返回 / 开关不调用 /
+  journal 跳过 / 512 与最低推理档 / 预算补扣；`pipeline.test.mjs` 与 `reject-consume.test.mjs`
+  按「多一次调用、detail 多一段」做了最小调整）。
+- **peer**：仍为 `>=0.7.0 <0.14.0`（本轮不动契约，只加一层写前判定）。
+
 ## 已知边界（0.3.0）
 
 - **自动触发已接线，但只写 L0 与「门槛达标才跑一次」**：`turn/end` 写进 pending 是纯本地追加；
@@ -686,8 +719,9 @@ runlog 的 `detail`；`/status` 的「上次失败」直接显示它，并给一
   所以单独查）；`detail` 是 0.2.0 起才有的字段，老记录会显示「没有 detail」。
 - **peer 范围是 `>=0.7.0 <0.11.0`**：覆盖主插件 0.7.x–0.10.x。`supersedeEntry` 是 0.10.0 起才有的导出，
   本插件用特性检测接入（没有就回退原子替换）；再往上的主插件大版本需要重新核对 `./store` 的导出。
-- **跨池去重只挡确定性重复**：完全相同或 BM25 归一化相似度 ≥0.95 才会被拦；「换一套词说同一件事」
-  这类纯语义同义改写仍交给归并裁决（模型判断），不保证 100% 拦住——这是「宁可漏杀不可误杀」的取舍。
+- **跨池去重只挡确定性重复**：完全相同或 BM25 归一化相似度 ≥0.95 才会被拦。0.7.0 起「换一套词
+  说同一件事」交给 `dedupeModel` 的模型裁决，但仍**不保证 100%** 拦住（模型也会漏判）——
+  这是「宁可漏杀不可误杀」的取舍：漏一条重复的代价，小于把一条真新结论静默判死。
 
 ## 仓库结构
 
@@ -706,6 +740,7 @@ runlog 的 `detail`；`/status` 的「上次失败」直接显示它，并给一
 | `lib/mode.js` | 运行档位 `off` / `observe` / `auto` 的唯一口径（含与 `enabled` 的优先级） |
 | `lib/extractor.js` | 抽取/裁决提示词与模型 JSON 解析 |
 | `lib/merger.js` | 预筛（BM25 近邻）、算子校验、冲突规则 |
+| `lib/dedupe.js` | **0.7.0** 近重复模型裁决：top-2 近邻 + 一次小调用判等价改写，失败全部放行 |
 | `lib/gate.js` | 确定性写入闸口：空壳/过程/太短/缺时点/同批重复，只丢不改写 |
 | `lib/migrate.js` | 历史暂存回填：计划、行文件合并、`workspaceId` 改写、游标迁移 |
 | `lib/pending.js` | L0 暂存行读写、滚动压实、`resolveBucket()` 桶黏性、`findBucketSplits()` |

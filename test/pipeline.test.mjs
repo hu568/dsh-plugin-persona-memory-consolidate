@@ -63,7 +63,8 @@ try {
     assert.ok(happy.chars > 0);
     assert.equal(happy.candidates, 2);
     assert.equal(happy.ops, 2);
-    assert.equal(happy.calls, 2, '抽取 1 次 + 裁决 1 次（计划里的「同一次调用」在事实上不可能）');
+    // 0.7.0 起固定 +1：抽取 1 次 + 近重复模型裁决 1 次 + 归并裁决 1 次。
+    assert.equal(happy.calls, 3, '抽取 + 判重 + 归并裁决各 1 次（判重是一次独立的短调用）');
     assert.equal(happy.counts.written, 1, '1 条 ADD');
     assert.equal(happy.counts.replaced, 1, '1 条 UPDATE');
     assert.equal(happy.counts.failed, 0);
@@ -96,7 +97,7 @@ try {
     assert.ok(existsSync(join(happy.snapshot, 'manifest.json')));
     const logged = readLastRun({ file: runtime.runLog.path });
     assert.equal(logged.runId, happy.runId);
-    assert.equal(logged.calls, 2);
+    assert.equal(logged.calls, 3, 'runlog 的 calls 也要含判重那一次');
     assert.equal(logged.status, 'OK');
     assert.equal(logged.counts.written, 1);
     assert.ok(logged.watermarks.fact.lines > 0, '水位要进 runlog');
@@ -249,7 +250,13 @@ try {
     assert.ok(bucketFactText.includes(replies[0]) && bucketFactText.includes(replies[1]), '两条结论都要落盘');
     const titled = all.runs.find((run) => run.bucket === 'ws-7');
     assert.equal(titled.title, '工作区七', '桶标题来自工作区注册表');
-    assert.equal(perBucket.budget.snapshot().used.total, 1, '一次运行只占一次预算（额外的裁决调用才补扣）');
+    // 0.7.0 的判重只在「池里有词面可比的条目」时才发：这两个桶的正文与池毫无交集
+    // （topNeighbors 为空 ⇒ 没有近邻可给模型看），所以不花这次调用，calls 仍是 1。
+    assert.equal(titled.calls, 1, 'ws-7 跑时池里没有词面可比的条目 ⇒ 不发判重调用');
+    // ws-8 在 ws-7 写完之后才读池，池里已经有「第一桶写入…」（共享「写入」⇒ 有近邻）⇒ 多一次判重，
+    // 预算补扣成 1 + 1 = 2。口径不变：锁按运行算、预算按真实调用算。
+    assert.equal(all.runs.find((run) => run.bucket === 'ws-8').calls, 2, 'ws-8：抽取 + 判重各 1 次');
+    assert.equal(perBucket.budget.snapshot().used.total, 2, '一次运行只占一次预算，额外的判重调用补扣');
     assert.equal(perBucket.budget.snapshot().busy, 0, '跑完必须放锁');
 
     /* 全空 → 明确 skipped:empty */
@@ -507,7 +514,8 @@ try {
 
     assert.equal(crossed.status, 'OK', `跨池闸口后应成功：${crossed.status} / ${crossed.reason}`);
     assert.equal(crossed.candidates, 2, '3 条候选按跨池拦住 1 条，其余 2 条进归并');
-    assert.equal(crossed.calls, 2, '抽取 1 次 + ADJUDICATE 裁决 1 次（被拦的那条不该再花钱）');
+    // 0.7.0 起 +1：抽取 + 判重 + ADJUDICATE 裁决各 1 次（被跨池拦掉的那条既不判重也不裁决）。
+    assert.equal(crossed.calls, 3, '抽取 1 + 判重 1 + 归并裁决 1（被拦的那条不该再花钱）');
     assert.deepEqual(
         { total: crossed.gate.total, kept: crossed.gate.kept, dropped: crossed.gate.dropped },
         { total: 3, kept: 2, dropped: 1 },

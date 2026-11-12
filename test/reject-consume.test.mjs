@@ -213,7 +213,9 @@ try {
     assert.equal(journalRun.marked.marked, 6);
     const journalLogged = readLastRun({ file: jc.runtime.runLog.path });
     assert.equal(journalLogged.status, 'OK');
-    assert.equal(journalLogged.detail, 'demoted:store-rejected:问句（请改写成陈述句）', 'runlog 必须带降级原因');
+    // detail 是**多段复合**（0.7.0 起还会带 dedupe:checked=…）：断言「包含」而不是逐字相等，
+    // 否则每加一段观测信息就要改一次测试（旧断言的意图只是「降级原因不能丢」）。
+    assert.ok(String(journalLogged.detail).includes('demoted:store-rejected:问句（请改写成陈述句）'), 'runlog 必须带降级原因：' + journalLogged.detail);
 
     /* 3b. drop 拒绝：记 FAILED 带原因，但**不阻塞消费**（否则永久毒行） */
     const dropDir = makeDir('proj-rej-drop');
